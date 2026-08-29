@@ -1,5 +1,5 @@
 ----------------------------------------------------------------
--- remote admin 4.6.1 :: file 3/4 :: identifier + aimlock + overseer
+-- remote admin 4.7 :: file 3/4 :: identifier + aimlock + overseer
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -22,9 +22,7 @@ local FONT_B = Enum.Font.RobotoCondensed
 
 local function make(class, props, parent)
     local inst = Instance.new(class)
-    for k, v in pairs(props) do
-        inst[k] = v
-    end
+    for k, v in pairs(props) do inst[k] = v end
     inst.Parent = parent
     return inst
 end
@@ -105,7 +103,20 @@ local function newTab(page, pageName, root)
         local r = rows[focus]
         hl.Parent = r.frame
         hl.Visible = root:GetAttribute("Open") == true
+            and root:GetAttribute("Pane") == "content"
+            and root:GetAttribute("ActivePage") == pageName
         root:SetAttribute("NavType", (r.kind == "slider") and "slider" or "row")
+        if hl.Visible then
+            local abs = r.frame.AbsolutePosition.Y - content.AbsolutePosition.Y
+            if abs < 0 or abs + r.frame.AbsoluteSize.Y > content.AbsoluteSize.Y then
+                content.CanvasPosition = Vector2.new(0, math.max(0, content.CanvasPosition.Y + abs - 40))
+            end
+        end
+    end
+
+    local function contentActive()
+        return root:GetAttribute("Pane") == "content"
+            and root:GetAttribute("ActivePage") == pageName
     end
 
     local navConn = root:WaitForChild("NavEvent", 10)
@@ -120,20 +131,32 @@ local function newTab(page, pageName, root)
                 end
                 return
             end
-            if root:GetAttribute("ActivePage") ~= pageName then return end
+            if action == "pane" then
+                if a == "content" and root:GetAttribute("ActivePage") == pageName then
+                    setFocus(focus == 0 and 1 or focus)
+                else
+                    hl.Visible = false
+                end
+                return
+            end
             if action == "page" then
-                if a == pageName then
+                if a == pageName and root:GetAttribute("Pane") == "content" then
                     setFocus(focus == 0 and 1 or focus)
                 else
                     hl.Visible = false
                 end
-            elseif action == "open" then
-                if a then
+                return
+            end
+            if action == "open" then
+                if a and contentActive() then
                     setFocus(focus == 0 and 1 or focus)
                 else
                     hl.Visible = false
                 end
-            elseif action == "move" then
+                return
+            end
+            if not contentActive() then return end
+            if action == "move" then
                 if #rows > 0 then setFocus(focus + a) end
             elseif action == "activate" then
                 local r = rows[focus]
@@ -215,6 +238,34 @@ local function newTab(page, pageName, root)
             BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, h),
             LayoutOrder = nextOrder(),
         }, content)
+    end
+
+    function ui.action(labelText, fn)
+        local row = ui.row(24)
+        local btn = make("TextButton", {
+            Size = UDim2.new(1, -56, 1, 0), BackgroundColor3 = COLORS.Panel,
+            BorderSizePixel = 0, AutoButtonColor = false, Font = FONT_B,
+            Text = ">  " .. labelText, TextSize = 14, TextColor3 = COLORS.TextSecondary,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        strokeOn(btn)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, btn)
+        local name = labelText:gsub("%W", "_")
+        local chip = make("TextLabel", {
+            BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -52, 0, 0), Size = UDim2.new(0, 48, 1, 0),
+            Font = Enum.Font.Code, TextSize = 12, TextColor3 = COLORS.TextMuted,
+            TextXAlignment = Enum.TextXAlignment.Right, Text = "[--]",
+        }, row)
+        local function refreshChip()
+            local k = root:GetAttribute("Bind_" .. prefix .. name)
+            chip.Text = "[" .. ((k and k ~= "") and k or "--") .. "]"
+            chip.TextColor3 = (k and k ~= "") and COLORS.Active or COLORS.TextMuted
+        end
+        refreshChip()
+        root:GetAttributeChangedSignal("Bind_" .. prefix .. name):Connect(refreshChip)
+        btn.MouseButton1Click:Connect(fn)
+        ui.registerRow(row, "row", fn, name)
     end
 
     function ui.toggle(labelText, state, key, onChange)
