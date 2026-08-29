@@ -1,15 +1,15 @@
 ----------------------------------------------------------------
--- remote admin 4.3 :: file 1/3 :: core + ui
--- bus in ReplicatedStorage (cross-script visible), UI in PlayerGui
+-- remote admin 4.6 :: file 1/4 :: core + ui + keyboard nav
 ----------------------------------------------------------------
+print("[RemoteAdmin] file 1 parsed, starting core")
 local CORE_OK, CORE_ERR = xpcall(function()
 
 	local Players = game:GetService("Players")
 	local UserInputService = game:GetService("UserInputService")
 	local ReplicatedStorage = game:GetService("ReplicatedStorage")
+	local RunService = game:GetService("RunService")
 
 	local TOGGLE_KEYS = { Enum.KeyCode.M, Enum.KeyCode.RightShift }
-	local IGNORE_GAMEPROCESSED = true
 	local WINDOW_SIZE = UDim2.fromOffset(860, 480)
 	local HEADER_HEIGHT = 34
 	local PLAYERLIST_W = 0.235
@@ -34,11 +34,9 @@ local CORE_OK, CORE_ERR = xpcall(function()
 		LocalPlayer = Players.LocalPlayer
 	end
 	assert(LocalPlayer, "[RemoteAdmin] no LocalPlayer: run on the CLIENT only")
-
 	local playerGui = LocalPlayer:WaitForChild("PlayerGui", 10)
 	assert(playerGui, "[RemoteAdmin] PlayerGui never appeared")
 
-	-- re-inject: wipe everything we own
 	pcall(function()
 		local old = ReplicatedStorage:FindFirstChild("RA_BUS")
 		if old then old:Destroy() end
@@ -52,19 +50,18 @@ local CORE_OK, CORE_ERR = xpcall(function()
 		if old then old:Destroy() end
 	end)
 
-	-- the bus: modules find this. ReplicatedStorage is visible to all client scripts
 	local bus = Instance.new("Folder")
 	bus.Name = "RA_BUS"
 	bus.Parent = ReplicatedStorage
+	bus:SetAttribute("NavType", "row")
 
 	local conns = {}
 
-	-- ===== HUD =====
 	local screenGui = Instance.new("ScreenGui")
 	screenGui.Name = "RemoteAdminHUD"
 	screenGui.ResetOnSpawn = false
 	screenGui.IgnoreGuiInset = true
-	screenGui.DisplayOrder = 50
+	screenGui.DisplayOrder = 1000
 	screenGui.Enabled = false
 	screenGui.Parent = playerGui
 
@@ -101,7 +98,7 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	titleText.BackgroundTransparency = 1
 	titleText.Size = UDim2.new(1, 0, 1, 0)
 	titleText.Font = FONT_H
-	titleText.Text = "REMOTE ADMIN 4.3"
+	titleText.Text = "REMOTE ADMIN 4.6"
 	titleText.TextColor3 = COLORS.TextSecondary
 	titleText.TextSize = 16
 	titleText.TextXAlignment = Enum.TextXAlignment.Center
@@ -145,7 +142,6 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	body.Position = UDim2.new(0, 0, 0, HEADER_HEIGHT)
 	body.Parent = mainFrame
 
-	-- players column
 	local playerPanel = Instance.new("Frame")
 	playerPanel.Name = "PlayerPanel"
 	playerPanel.BackgroundColor3 = COLORS.Panel
@@ -222,6 +218,10 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	local focusEvent = Instance.new("BindableEvent")
 	focusEvent.Name = "FocusEvent"
 	focusEvent.Parent = bus
+
+	local navEvent = Instance.new("BindableEvent")
+	navEvent.Name = "NavEvent"
+	navEvent.Parent = bus
 
 	local function singleSelected()
 		local plr, count = nil, 0
@@ -335,7 +335,6 @@ local CORE_OK, CORE_ERR = xpcall(function()
 		end
 	end)
 
-	-- actions column
 	local actionPanel = Instance.new("Frame")
 	actionPanel.Name = "ActionPanel"
 	actionPanel.BackgroundColor3 = COLORS.Panel
@@ -383,7 +382,6 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	actionMenuLayout.Padding = UDim.new(0, 2)
 	actionMenuLayout.Parent = actionMenuList
 
-	-- workspace column
 	local workspacePanel = Instance.new("Frame")
 	workspacePanel.Name = "WorkspacePanel"
 	workspacePanel.BackgroundColor3 = COLORS.Background
@@ -403,10 +401,21 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	pagesFolder.Name = "Pages"
 	pagesFolder.Parent = workspacePanel
 
+	local function categoryNames()
+		local out = {}
+		for _, b in ipairs(actionMenuList:GetChildren()) do
+			if b:IsA("TextButton") and string.sub(b.Name, 1, 7) == "CatBtn_" then
+				table.insert(out, string.sub(b.Name, 8))
+			end
+		end
+		return out
+	end
+
 	local selectFn = Instance.new("BindableFunction")
 	selectFn.Name = "SelectCategory"
 	selectFn.Parent = bus
-	selectFn.OnInvoke = function(name)
+
+	local function selectPage(name)
 		for _, pg in ipairs(pagesFolder:GetChildren()) do
 			pg.Visible = (name ~= nil and pg.Name == "Page_" .. name)
 		end
@@ -417,9 +426,24 @@ local CORE_OK, CORE_ERR = xpcall(function()
 				b.BackgroundColor3 = sel and COLORS.Background or COLORS.Panel
 			end
 		end
+		bus:SetAttribute("ActivePage", name)
+		navEvent:Fire("page", name)
 	end
 
-	-- ===== open / close =====
+	selectFn.OnInvoke = selectPage
+
+	local function cycleCategory(dir)
+		local names = categoryNames()
+		if #names == 0 then return end
+		local cur = bus:GetAttribute("ActivePage")
+		local idx = 1
+		for i, n in ipairs(names) do
+			if n == cur then idx = i break end
+		end
+		local nxt = ((idx - 1 + dir) % #names) + 1
+		selectPage(names[nxt])
+	end
+
 	local refreshBadge
 
 	local function setOpen(open)
@@ -429,8 +453,19 @@ local CORE_OK, CORE_ERR = xpcall(function()
 			refreshBadge()
 		end
 		if open then
-			UserInputService.MouseIconEnabled = true
-			UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			local cur = bus:GetAttribute("ActivePage")
+			local names = categoryNames()
+			if cur and table.find(names, cur) then
+				selectPage(cur)
+			elseif #names > 0 then
+				selectPage(names[1])
+			end
+			navEvent:Fire("open", true)
+		else
+			navEvent:Fire("open", false)
+			if bus:GetAttribute("FP") ~= true then
+				UserInputService.MouseBehavior = Enum.MouseBehavior.Default
+			end
 		end
 	end
 
@@ -438,19 +473,80 @@ local CORE_OK, CORE_ERR = xpcall(function()
 	for _, k in ipairs(TOGGLE_KEYS) do
 		keySet[k] = true
 	end
+
+	local NAV_KEYS = {
+		[Enum.KeyCode.Up] = true, [Enum.KeyCode.Down] = true,
+		[Enum.KeyCode.Left] = true, [Enum.KeyCode.Right] = true,
+		[Enum.KeyCode.Return] = true, [Enum.KeyCode.Space] = true,
+		[Enum.KeyCode.Backspace] = true,
+	}
+
 	table.insert(conns, UserInputService.InputBegan:Connect(function(input, gameProcessed)
-		if not keySet[input.KeyCode] then return end
-		if gameProcessed and not IGNORE_GAMEPROCESSED then return end
+		local key = input.KeyCode
+		if not key or key == Enum.KeyCode.Unknown then return end
 		if UserInputService:GetFocusedTextBox() then return end
-		setOpen(not screenGui.Enabled)
+
+		if screenGui.Enabled then
+			-- menu open: keyboard first, nav works even if the game claims keys
+			if keySet[key] then
+				setOpen(false)
+				return
+			end
+			if key == Enum.KeyCode.Up then navEvent:Fire("move", -1) return end
+			if key == Enum.KeyCode.Down then navEvent:Fire("move", 1) return end
+			if key == Enum.KeyCode.Return or key == Enum.KeyCode.Space then navEvent:Fire("activate") return end
+			if key == Enum.KeyCode.Left or key == Enum.KeyCode.Right then
+				local d = (key == Enum.KeyCode.Right) and 1 or -1
+				if bus:GetAttribute("NavType") == "slider" then
+					navEvent:Fire("adjust", d)
+				else
+					cycleCategory(d)
+				end
+				return
+			end
+			local shift = UserInputService:IsKeyDown(Enum.KeyCode.LeftShift)
+				or UserInputService:IsKeyDown(Enum.KeyCode.RightShift)
+			if shift and key == Enum.KeyCode.Backspace then
+				navEvent:Fire("clearbind")
+				return
+			end
+			if shift and not NAV_KEYS[key] then
+				navEvent:Fire("bind", key.Name)
+				return
+			end
+			if key == Enum.KeyCode.Escape then
+				setOpen(false)
+			end
+			return
+		end
+
+		-- menu closed
+		if keySet[key] then
+			setOpen(true)
+			return
+		end
+		if gameProcessed then return end
+		for attr, val in pairs(bus:GetAttributes()) do
+			if string.sub(attr, 1, 5) == "Bind_" and val == key.Name then
+				navEvent:Fire("fire", string.sub(attr, 6))
+			end
+		end
 	end))
 
-	-- ===== badge =====
+	-- menu never steals the mouse: cursor stays locked, Left Alt frees it,
+	-- unless first person / spectator owns the mouse (they manage it themselves)
+	table.insert(conns, RunService.Heartbeat:Connect(function()
+		if not screenGui.Enabled then return end
+		if bus:GetAttribute("FP") == true then return end
+		UserInputService.MouseBehavior = UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt)
+			and Enum.MouseBehavior.Default or Enum.MouseBehavior.LockCenter
+	end))
+
 	local badgeGui = Instance.new("ScreenGui")
 	badgeGui.Name = "RemoteAdminBadge"
 	badgeGui.ResetOnSpawn = false
 	badgeGui.IgnoreGuiInset = true
-	badgeGui.DisplayOrder = 100
+	badgeGui.DisplayOrder = 1001
 	badgeGui.Parent = playerGui
 
 	local badge = Instance.new("TextButton")
@@ -478,7 +574,7 @@ local CORE_OK, CORE_ERR = xpcall(function()
 				n += 1
 			end
 		end
-		badge.Text = "RA " .. n .. "/4"
+		badge.Text = "RA " .. n .. "/8"
 		badge.TextColor3 = screenGui.Enabled and COLORS.Active or COLORS.TextMuted
 	end
 
@@ -492,7 +588,6 @@ local CORE_OK, CORE_ERR = xpcall(function()
 		end
 	end))
 
-	-- ===== shutdown =====
 	bus.Destroying:Connect(function()
 		for i = #conns, 1, -1 do
 			pcall(function()
@@ -513,7 +608,7 @@ local CORE_OK, CORE_ERR = xpcall(function()
 
 	setOpen(false)
 	bus:SetAttribute("Ready", true)
-	print("[RemoteAdmin] core ready | M / RightShift / click RA badge")
+	print("[RemoteAdmin] core ready | M / RightShift / RA badge | arrows navigate, shift+key binds")
 
 end, function(e)
 	warn("[RemoteAdmin] core failed: " .. tostring(e))
