@@ -1,5 +1,5 @@
 ----------------------------------------------------------------
--- remote admin 4.6.1 :: file 4/4 :: bighead + misc + user checker
+-- remote admin 4.7 :: file 4/4 :: bighead + misc + user checker + mod tools
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -22,9 +22,7 @@ local FONT_B = Enum.Font.RobotoCondensed
 
 local function make(class, props, parent)
     local inst = Instance.new(class)
-    for k, v in pairs(props) do
-        inst[k] = v
-    end
+    for k, v in pairs(props) do inst[k] = v end
     inst.Parent = parent
     return inst
 end
@@ -105,7 +103,20 @@ local function newTab(page, pageName, root)
         local r = rows[focus]
         hl.Parent = r.frame
         hl.Visible = root:GetAttribute("Open") == true
+            and root:GetAttribute("Pane") == "content"
+            and root:GetAttribute("ActivePage") == pageName
         root:SetAttribute("NavType", (r.kind == "slider") and "slider" or "row")
+        if hl.Visible then
+            local abs = r.frame.AbsolutePosition.Y - content.AbsolutePosition.Y
+            if abs < 0 or abs + r.frame.AbsoluteSize.Y > content.AbsoluteSize.Y then
+                content.CanvasPosition = Vector2.new(0, math.max(0, content.CanvasPosition.Y + abs - 40))
+            end
+        end
+    end
+
+    local function contentActive()
+        return root:GetAttribute("Pane") == "content"
+            and root:GetAttribute("ActivePage") == pageName
     end
 
     local navConn = root:WaitForChild("NavEvent", 10)
@@ -120,20 +131,32 @@ local function newTab(page, pageName, root)
                 end
                 return
             end
-            if root:GetAttribute("ActivePage") ~= pageName then return end
+            if action == "pane" then
+                if a == "content" and root:GetAttribute("ActivePage") == pageName then
+                    setFocus(focus == 0 and 1 or focus)
+                else
+                    hl.Visible = false
+                end
+                return
+            end
             if action == "page" then
-                if a == pageName then
+                if a == pageName and root:GetAttribute("Pane") == "content" then
                     setFocus(focus == 0 and 1 or focus)
                 else
                     hl.Visible = false
                 end
-            elseif action == "open" then
-                if a then
+                return
+            end
+            if action == "open" then
+                if a and contentActive() then
                     setFocus(focus == 0 and 1 or focus)
                 else
                     hl.Visible = false
                 end
-            elseif action == "move" then
+                return
+            end
+            if not contentActive() then return end
+            if action == "move" then
                 if #rows > 0 then setFocus(focus + a) end
             elseif action == "activate" then
                 local r = rows[focus]
@@ -215,6 +238,34 @@ local function newTab(page, pageName, root)
             BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, h),
             LayoutOrder = nextOrder(),
         }, content)
+    end
+
+    function ui.action(labelText, fn)
+        local row = ui.row(24)
+        local btn = make("TextButton", {
+            Size = UDim2.new(1, -56, 1, 0), BackgroundColor3 = COLORS.Panel,
+            BorderSizePixel = 0, AutoButtonColor = false, Font = FONT_B,
+            Text = ">  " .. labelText, TextSize = 14, TextColor3 = COLORS.TextSecondary,
+            TextXAlignment = Enum.TextXAlignment.Left,
+        }, row)
+        strokeOn(btn)
+        make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, btn)
+        local name = labelText:gsub("%W", "_")
+        local chip = make("TextLabel", {
+            BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+            Position = UDim2.new(1, -52, 0, 0), Size = UDim2.new(0, 48, 1, 0),
+            Font = Enum.Font.Code, TextSize = 12, TextColor3 = COLORS.TextMuted,
+            TextXAlignment = Enum.TextXAlignment.Right, Text = "[--]",
+        }, row)
+        local function refreshChip()
+            local k = root:GetAttribute("Bind_" .. prefix .. name)
+            chip.Text = "[" .. ((k and k ~= "") and k or "--") .. "]"
+            chip.TextColor3 = (k and k ~= "") and COLORS.Active or COLORS.TextMuted
+        end
+        refreshChip()
+        root:GetAttributeChangedSignal("Bind_" .. prefix .. name):Connect(refreshChip)
+        btn.MouseButton1Click:Connect(fn)
+        ui.registerRow(row, "row", fn, name)
     end
 
     function ui.toggle(labelText, state, key, onChange)
@@ -582,7 +633,7 @@ runModule("Bighead", function(root)
 end)
 
 -- ================================================================
--- MISC
+-- MISC (noclip moved to MOD TOOLS)
 -- ================================================================
 runModule("Misc", function(root)
     local hud, mainFrame, list, pages = resolveUI(root)
@@ -597,7 +648,6 @@ runModule("Misc", function(root)
     local misc = {
         cyber = false, cyberPower = 8,
         antiLook = false, antiLookDot = 97, antiLookDist = 150, antiLookCD = 25,
-        noclip = false,
         spin = false, spinSpeed = 40,
         flicker = false, flickerRate = 10,
     }
@@ -612,7 +662,6 @@ runModule("Misc", function(root)
         local t = {}
         if misc.cyber then table.insert(t, "cyber") end
         if misc.antiLook then table.insert(t, "anti-look") end
-        if misc.noclip then table.insert(t, "noclip") end
         if misc.spin then table.insert(t, "spin") end
         if misc.flicker then table.insert(t, "flicker") end
         if #t == 0 then return nil end
@@ -707,14 +756,6 @@ runModule("Misc", function(root)
             end
         end
 
-        if misc.noclip and not hum.SeatPart then
-            for _, d in ipairs(char:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    d.CanCollide = false
-                end
-            end
-        end
-
         if misc.spin and not hum.SeatPart then
             ro.AssemblyAngularVelocity = Vector3.new(0, misc.spinSpeed, 0)
         end
@@ -740,16 +781,6 @@ runModule("Misc", function(root)
                 startFlicker()
             else
                 stopFlicker()
-            end
-        end
-        if key == "noclip" and not v then
-            local char = LocalPlayer.Character
-            if char then
-                for _, d in ipairs(char:GetDescendants()) do
-                    if d:IsA("BasePart") then
-                        d.CanCollide = true
-                    end
-                end
             end
         end
         if key == "spin" and not v then
@@ -779,11 +810,11 @@ runModule("Misc", function(root)
     end)
 
     ui.section("TRICKS")
-    ui.toggle("Noclip", misc, "noclip", onToggles)
     ui.toggle("Spin", misc, "spin", onToggles)
     ui.slider("Spin Speed", misc, "spinSpeed", 5, 100)
 
     ui.label("anti-look reads body facing, enemy cameras are not visible client side")
+    ui.label("noclip and fly live in MOD TOOLS now")
 
     table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
         antiLookNext = 0
@@ -804,16 +835,9 @@ runModule("Misc", function(root)
             RunService:UnbindFromRenderStep("RA_misc")
         end)
         local char = LocalPlayer.Character
-        if char then
-            for _, d in ipairs(char:GetDescendants()) do
-                if d:IsA("BasePart") then
-                    d.CanCollide = true
-                end
-            end
-            local ro = char:FindFirstChild("HumanoidRootPart")
-            if ro then
-                ro.AssemblyAngularVelocity = Vector3.zero
-            end
+        local ro = char and char:FindFirstChild("HumanoidRootPart")
+        if ro then
+            ro.AssemblyAngularVelocity = Vector3.zero
         end
     end)
 end)
@@ -1066,4 +1090,329 @@ runModule("UserChecker", function(root)
     end)
 
     clearAll()
+end)
+
+-- ================================================================
+-- MOD TOOLS
+-- ================================================================
+runModule("ModTools", function(root)
+    local hud, mainFrame, list, pages = resolveUI(root)
+    if not pages then
+        warn("[RemoteAdmin/ModTools] window structure not found")
+        return
+    end
+    local page = newCategory(root, list, pages, "MOD TOOLS")
+    local ui = newTab(page, "MOD TOOLS", root)
+    local statusLabel = ui.status()
+
+    local tools = {
+        fly = false, flySpeed = 60,
+        noclip = false,
+        xray = false, xrayAmount = 75,
+        fullbright = false,
+        highlights = false,
+    }
+
+    local conns = {}
+    local focused = nil
+    table.insert(conns, root:WaitForChild("FocusEvent").Event:Connect(function(plr)
+        focused = plr
+    end))
+
+    local function activeList()
+        local t = {}
+        if tools.fly then table.insert(t, "fly") end
+        if tools.noclip then table.insert(t, "noclip") end
+        if tools.xray then table.insert(t, "xray") end
+        if tools.fullbright then table.insert(t, "fullbright") end
+        if tools.highlights then table.insert(t, "highlights") end
+        if #t == 0 then return nil end
+        return table.concat(t, "+")
+    end
+
+    local function refreshStatus()
+        local a = activeList()
+        statusLabel.Text = "STATUS  " .. (a or "idle")
+        statusLabel.TextColor3 = a and COLORS.Active or COLORS.TextMuted
+    end
+
+    -- x-ray: walls go translucent locally, characters stay solid
+    local xrayOrig = setmetatable({}, { __mode = "k" })
+    local xrayConn = nil
+    local function xrayApplyPart(d)
+        if not d:IsA("BasePart") or d:IsA("Terrain") then return end
+        local m = d:FindFirstAncestorOfClass("Model")
+        if m and m:FindFirstChildOfClass("Humanoid") then return end
+        if xrayOrig[d] == nil then
+            xrayOrig[d] = d.Transparency
+        end
+        d.Transparency = math.max(d.Transparency, tools.xrayAmount / 100)
+    end
+    local function setXray(on)
+        if on then
+            for _, d in ipairs(workspace:GetDescendants()) do
+                xrayApplyPart(d)
+            end
+            xrayConn = workspace.DescendantAdded:Connect(function(d)
+                task.defer(xrayApplyPart, d)
+            end)
+        else
+            if xrayConn then
+                xrayConn:Disconnect()
+                xrayConn = nil
+            end
+            for part, t in pairs(xrayOrig) do
+                pcall(function()
+                    part.Transparency = t
+                end)
+            end
+            table.clear(xrayOrig)
+        end
+    end
+
+    -- fullbright
+    local fbStore = nil
+    local function setFullbright(on)
+        local L = game:GetService("Lighting")
+        if on then
+            fbStore = {
+                brightness = L.Brightness, ambient = L.Ambient,
+                outdoor = L.OutdoorAmbient, clock = L.ClockTime,
+                fogEnd = L.FogEnd, shadows = L.GlobalShadows,
+            }
+            L.Brightness = 3
+            L.Ambient = Color3.fromRGB(200, 200, 200)
+            L.OutdoorAmbient = Color3.fromRGB(200, 200, 200)
+            L.ClockTime = 14
+            L.FogEnd = 1e6
+            L.GlobalShadows = false
+            local atmo = L:FindFirstChildOfClass("Atmosphere")
+            if atmo then
+                fbStore.density = atmo.Density
+                atmo.Density = 0
+            end
+        else
+            if fbStore then
+                L.Brightness = fbStore.brightness
+                L.Ambient = fbStore.ambient
+                L.OutdoorAmbient = fbStore.outdoor
+                L.ClockTime = fbStore.clock
+                L.FogEnd = fbStore.fogEnd
+                L.GlobalShadows = fbStore.shadows
+                local atmo = L:FindFirstChildOfClass("Atmosphere")
+                if atmo and fbStore.density then
+                    atmo.Density = fbStore.density
+                end
+                fbStore = nil
+            end
+        end
+    end
+
+    -- player highlights
+    local hlTab = setmetatable({}, { __mode = "k" })
+    local hlScanAcc = 0
+    local function hlScan()
+        for _, plr in ipairs(Players:GetPlayers()) do
+            local char = plr.Character
+            if char and not hlTab[char] then
+                local h = Instance.new("Highlight")
+                h.FillTransparency = 1
+                h.OutlineColor = plr.Team and plr.TeamColor.Color or Color3.fromRGB(255, 80, 80)
+                h.OutlineTransparency = 0
+                h.DepthMode = Enum.HighlightDepthMode.AlwaysOnTop
+                h.Adornee = char
+                h.Parent = char
+                hlTab[char] = h
+            end
+        end
+        for char in pairs(hlTab) do
+            if not char.Parent then
+                hlTab[char] = nil
+            end
+        end
+    end
+    local function setHighlights(on)
+        if not on then
+            for _, h in pairs(hlTab) do
+                pcall(function()
+                    h:Destroy()
+                end)
+            end
+            table.clear(hlTab)
+        end
+    end
+
+    -- actions
+    local function tpCursor()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local cam = workspace.CurrentCamera
+        if not (hrp and cam) then return end
+        local m = UserInputService:GetMouseLocation()
+        local ray = cam:ViewportPointToRay(m.X, m.Y)
+        local p = RaycastParams.new()
+        p.FilterType = Enum.RaycastFilterType.Exclude
+        p.FilterDescendantsInstances = { char }
+        local hit = workspace:Raycast(ray.Origin, ray.Direction * 1000, p)
+        local pos
+        if hit then
+            pos = hit.Position + hit.Normal * 3 + Vector3.new(0, 2, 0)
+        else
+            pos = ray.Origin + ray.Direction * 500
+        end
+        hrp.CFrame = CFrame.new(pos)
+        statusLabel.Text = "STATUS  tp to cursor"
+        statusLabel.TextColor3 = COLORS.Active
+    end
+
+    local function tpSelected()
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if not hrp then return end
+        if not focused then
+            statusLabel.Text = "STATUS  no player selected (PLAYERS pane)"
+            statusLabel.TextColor3 = COLORS.TextMuted
+            return
+        end
+        local t = focused.Character and focused.Character:FindFirstChild("HumanoidRootPart")
+        if not t then
+            statusLabel.Text = "STATUS  target has no character"
+            statusLabel.TextColor3 = COLORS.TextMuted
+            return
+        end
+        hrp.CFrame = t.CFrame * CFrame.new(0, 0, 4)
+        statusLabel.Text = "STATUS  tp to " .. focused.DisplayName
+        statusLabel.TextColor3 = COLORS.Active
+    end
+
+    -- per frame: noclip + fly + highlight scan
+    RunService:BindToRenderStep("RA_modtools", Enum.RenderPriority.Camera.Value + 1, function(dt)
+        dt = math.clamp(dt, 0.001, 0.1)
+        local char = LocalPlayer.Character
+        local hum = char and char:FindFirstChildOfClass("Humanoid")
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        local cam = workspace.CurrentCamera
+        if not (char and hum and hrp and cam) then return end
+        if hum.Health <= 0 then return end
+
+        if tools.noclip and not hum.SeatPart then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    d.CanCollide = false
+                end
+            end
+        end
+
+        if tools.fly and not hum.SeatPart then
+            local f, r = 0, 0
+            if UserInputService:IsKeyDown(Enum.KeyCode.W) then f += 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.S) then f -= 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.D) then r += 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.A) then r -= 1 end
+            local up = 0
+            if UserInputService:IsKeyDown(Enum.KeyCode.Space) then up += 1 end
+            if UserInputService:IsKeyDown(Enum.KeyCode.LeftShift) then up -= 1 end
+            local mv = cam.CFrame.LookVector * f + cam.CFrame.RightVector * r + Vector3.new(0, up, 0)
+            if mv.Magnitude > 0.01 then
+                hrp.AssemblyLinearVelocity = mv.Unit * tools.flySpeed
+            else
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+
+        if tools.highlights then
+            hlScanAcc += dt
+            if hlScanAcc > 0.5 then
+                hlScanAcc = 0
+                hlScan()
+            end
+        end
+    end)
+
+    local function onToggles(key, v)
+        if key == "xray" then
+            setXray(v)
+        elseif key == "fullbright" then
+            setFullbright(v)
+        elseif key == "highlights" then
+            setHighlights(v)
+        elseif key == "fly" and not v then
+            local char = LocalPlayer.Character
+            local hrp = char and char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        elseif key == "noclip" and not v then
+            local char = LocalPlayer.Character
+            if char then
+                for _, d in ipairs(char:GetDescendants()) do
+                    if d:IsA("BasePart") then
+                        d.CanCollide = true
+                    end
+                end
+            end
+        end
+        refreshStatus()
+    end
+
+    ui.section("MOVEMENT")
+    ui.toggle("Fly", tools, "fly", onToggles)
+    ui.slider("Fly Speed", tools, "flySpeed", 10, 300)
+    ui.toggle("Noclip", tools, "noclip", onToggles)
+
+    ui.section("TELEPORT")
+    ui.action("TP To Cursor", tpCursor)
+    ui.action("TP To Selected Player", tpSelected)
+    ui.label("select a player in the PLAYERS pane first (TAB to reach it)")
+
+    ui.section("VISION")
+    ui.toggle("X-Ray Walls", tools, "xray", onToggles)
+    ui.slider("X-Ray Amount", tools, "xrayAmount", 20, 95, function(v)
+        return v .. "%"
+    end)
+    ui.toggle("Fullbright", tools, "fullbright", onToggles)
+    ui.toggle("Player Highlights", tools, "highlights", onToggles)
+
+    ui.label("everything here is client side only")
+    ui.label("actions can be bound: focus the row, SHIFT+KEY")
+
+    table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+        if tools.noclip then
+            task.wait(0.5)
+            if tools.noclip then
+                local char = LocalPlayer.Character
+                if char then
+                    for _, d in ipairs(char:GetDescendants()) do
+                        if d:IsA("BasePart") then
+                            d.CanCollide = false
+                        end
+                    end
+                end
+            end
+        end
+    end))
+
+    root.Destroying:Connect(function()
+        for _, c in ipairs(conns) do
+            c:Disconnect()
+        end
+        setXray(false)
+        setFullbright(false)
+        setHighlights(false)
+        pcall(function()
+            RunService:UnbindFromRenderStep("RA_modtools")
+        end)
+        local char = LocalPlayer.Character
+        if char then
+            for _, d in ipairs(char:GetDescendants()) do
+                if d:IsA("BasePart") then
+                    d.CanCollide = true
+                end
+            end
+            local hrp = char:FindFirstChild("HumanoidRootPart")
+            if hrp then
+                hrp.AssemblyLinearVelocity = Vector3.zero
+            end
+        end
+    end)
 end)
