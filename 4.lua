@@ -1,7 +1,5 @@
 ----------------------------------------------------------------
--- remote admin 4.4 :: file 4 :: overseer
--- per player anomaly flags (TP / SPD / FLY), suspicion scoring,
--- and linear movement prediction markers
+-- remote admin 4.6 :: file 4/4 :: bighead + misc + user checker
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -35,6 +33,19 @@ local function strokeOn(inst)
 	make("UIStroke", { Color = COLORS.Divider, Thickness = 1, Transparency = 0.4 }, inst)
 end
 
+local function resolveUI(_root)
+	local hud = uiParent and uiParent:FindFirstChild("RemoteAdminHUD")
+	if not hud then return nil end
+	local mainFrame = hud:FindFirstChild("MainFrame")
+	local body = mainFrame and mainFrame:FindFirstChild("Body")
+	local ap = body and body:FindFirstChild("ActionPanel")
+	local list = ap and ap:FindFirstChild("ActionMenuList")
+	local ws = body and body:FindFirstChild("WorkspacePanel")
+	local pages = ws and ws:FindFirstChild("Pages")
+	if not (list and pages) then return nil end
+	return hud, mainFrame, list, pages
+end
+
 local function newCategory(root, list, pages, name)
 	local btn = make("TextButton", {
 		Name = "CatBtn_" .. name,
@@ -44,83 +55,18 @@ local function newCategory(root, list, pages, name)
 		TextXAlignment = Enum.TextXAlignment.Left,
 	}, list)
 	make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, btn)
-
 	local page = make("Frame", {
 		Name = "Page_" .. name,
 		BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false,
 	}, pages)
-
 	local sf = root:FindFirstChild("SelectCategory")
 	btn.MouseButton1Click:Connect(function()
-		if sf then
-			sf:Invoke(page.Visible and nil or name)
-		end
+		if sf then sf:Invoke(page.Visible and nil or name) end
 	end)
 	return page
 end
 
-local function runModule(name, fn)
-	task.spawn(function()
-		local function attempt(bus)
-			if bus:GetAttribute("Mod_" .. name) then
-				return
-			end
-			bus:SetAttribute("Mod_" .. name, true)
-			local ok, err = xpcall(fn, function(e)
-				warn("[RemoteAdmin/" .. name .. "] failed: " .. tostring(e))
-				warn(debug.traceback(e))
-			end, bus)
-			if ok then
-				print("[RemoteAdmin/" .. name .. "] loaded")
-			end
-		end
-
-		local function hookBus(bus)
-			if bus:GetAttribute("Ready") then
-				attempt(bus)
-				return
-			end
-			local aconn
-			aconn = bus:GetAttributeChangedSignal("Ready"):Connect(function()
-				if bus:GetAttribute("Ready") then
-					aconn:Disconnect()
-					attempt(bus)
-				end
-			end)
-		end
-
-		local existing = ReplicatedStorage:FindFirstChild("RA_BUS")
-		if existing then
-			hookBus(existing)
-		end
-		ReplicatedStorage.ChildAdded:Connect(function(child)
-			if child.Name == "RA_BUS" then
-				hookBus(child)
-			end
-		end)
-	end)
-end
-
-runModule("Overseer", function(root)
-	local hud = uiParent and uiParent:FindFirstChild("RemoteAdminHUD")
-	if not hud then
-		warn("[RemoteAdmin/Overseer] window structure not found")
-		return
-	end
-	local mainFrame = hud:FindFirstChild("MainFrame")
-	local body = mainFrame and mainFrame:FindFirstChild("Body")
-	local ap = body and body:FindFirstChild("ActionPanel")
-	local list = ap and ap:FindFirstChild("ActionMenuList")
-	local ws = body and body:FindFirstChild("WorkspacePanel")
-	local pages = ws and ws:FindFirstChild("Pages")
-	if not (list and pages) then
-		warn("[RemoteAdmin/Overseer] window structure not found")
-		return
-	end
-
-	local page = newCategory(root, list, pages, "OVERSEER")
-
-	-- tab ui
+local function newTab(page, pageName, root)
 	local content = Instance.new("ScrollingFrame")
 	content.BackgroundTransparency = 1
 	content.BorderSizePixel = 0
@@ -131,21 +77,123 @@ runModule("Overseer", function(root)
 	content.AutomaticCanvasSize = Enum.AutomaticSize.Y
 	content.Parent = page
 	make("UIListLayout", { Padding = UDim.new(0, 6), SortOrder = Enum.SortOrder.LayoutOrder }, content)
-	make("UIPadding", { PaddingLeft = UDim.new(0, 8), PaddingRight = UDim.new(0, 8) }, content)
+	make("UIPadding", { PaddingLeft = UDim.new(0, 4), PaddingRight = UDim.new(0, 4) }, content)
 
 	local order = 0
 	local function nextOrder()
 		order += 1
 		return order
 	end
-	local function section(text)
+
+	local rows = {}
+	local focus = 0
+	local hl = make("Frame", {
+		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 1, 0),
+		ZIndex = 60, Visible = false,
+	}, content)
+	make("UIStroke", { Color = COLORS.Active, Thickness = 1.5 }, hl)
+
+	local function setFocus(i)
+		local n = #rows
+		if n == 0 then
+			focus = 0
+			hl.Visible = false
+			return
+		end
+		focus = ((i - 1) % n) + 1
+		local r = rows[focus]
+		hl.Parent = r.frame
+		hl.Visible = root:GetAttribute("Open") == true
+		root:SetAttribute("NavType", (r.kind == "slider") and "slider" or "row")
+	end
+
+	local navConn = root:WaitForChild("NavEvent", 10)
+	if navConn then
+		navConn.Event:Connect(function(action, a)
+			if action == "fire" then
+				for _, r in ipairs(rows) do
+					if r.name == a and r.activate then
+						r.activate()
+						break
+					end
+				end
+				return
+			end
+			if root:GetAttribute("ActivePage") ~= pageName then return end
+			if action == "page" then
+				if a == pageName then
+					setFocus(focus == 0 and 1 or focus)
+				else
+					hl.Visible = false
+				end
+			elseif action == "open" then
+				if a then
+					setFocus(focus == 0 and 1 or focus)
+				else
+					hl.Visible = false
+				end
+			elseif action == "move" then
+				if #rows > 0 then setFocus(focus + a) end
+			elseif action == "activate" then
+				local r = rows[focus]
+				if r and r.activate then r.activate() end
+			elseif action == "adjust" then
+				local r = rows[focus]
+				if r and r.adjust then r.adjust(a) end
+			elseif action == "bind" then
+				local r = rows[focus]
+				if r and r.name then
+					root:SetAttribute("Bind_" .. r.name, a)
+				end
+			elseif action == "clearbind" then
+				local r = rows[focus]
+				if r and r.name then
+					root:SetAttribute("Bind_" .. r.name, "")
+				end
+			end
+		end)
+	end
+
+	local ui = {}
+
+	function ui.registerRow(frame, kind, activate, name)
+		table.insert(rows, { frame = frame, kind = kind or "row", activate = activate, name = name })
+	end
+
+	function ui.status()
+		return make("TextLabel", {
+			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
+			Font = FONT_B, Text = "STATUS  idle", TextSize = 13,
+			TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
+			LayoutOrder = nextOrder(),
+		}, content)
+	end
+
+	function ui.button(text, h, onClick)
+		local btn = make("TextButton", {
+			Size = UDim2.new(1, 0, 0, h or 28), BackgroundColor3 = COLORS.Panel,
+			BorderSizePixel = 0, AutoButtonColor = false, Font = FONT_H,
+			Text = text, TextSize = 14, TextColor3 = COLORS.TextSecondary,
+			TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
+		}, content)
+		strokeOn(btn)
+		make("UIPadding", { PaddingLeft = UDim.new(0, 8) }, btn)
+		if onClick then
+			btn.MouseButton1Click:Connect(onClick)
+			ui.registerRow(btn, "row", onClick, text:gsub("%W", "_"))
+		end
+		return btn
+	end
+
+	function ui.section(text)
 		make("TextLabel", {
 			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14),
 			Font = FONT_H, Text = text, TextSize = 13, TextColor3 = COLORS.TextMuted,
 			TextXAlignment = Enum.TextXAlignment.Left, LayoutOrder = nextOrder(),
 		}, content)
 	end
-	local function label(text)
+
+	function ui.label(text)
 		make("TextLabel", {
 			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 14),
 			Font = FONT_B, Text = text, TextSize = 13, TextColor3 = COLORS.TextMuted,
@@ -153,62 +201,100 @@ runModule("Overseer", function(root)
 		}, content)
 	end
 
-	local statusLabel = make("TextLabel", {
-		BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 16),
-		Font = FONT_B, Text = "STATUS  idle", TextSize = 13,
-		TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
-		LayoutOrder = nextOrder(),
-	}, content)
-
-	local function button(text, h)
-		local btn = make("TextButton", {
-			Size = UDim2.new(1, 0, 0, h or 28), BackgroundColor3 = COLORS.Panel,
-			BorderSizePixel = 0, AutoButtonColor = false, Font = FONT_H,
-			Text = text, TextSize = 14, TextColor3 = COLORS.TextSecondary,
+	function ui.row(h)
+		return make("Frame", {
+			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, h),
 			LayoutOrder = nextOrder(),
 		}, content)
-		strokeOn(btn)
-		return btn
 	end
 
-	local function toggle(labelText, state, key, onChange)
-		local r = make("Frame", {
-			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 22), LayoutOrder = nextOrder(),
-		}, content)
+	function ui.toggle(labelText, state, key, onChange)
+		local row = ui.row(22)
 		make("TextLabel", {
-			BackgroundTransparency = 1, Size = UDim2.new(1, -64, 1, 0),
+			BackgroundTransparency = 1, Size = UDim2.new(1, -110, 1, 0),
 			Font = FONT_B, Text = labelText, TextSize = 14,
 			TextColor3 = COLORS.TextSecondary, TextXAlignment = Enum.TextXAlignment.Left,
-		}, r)
+		}, row)
 		local btn = make("TextButton", {
 			Size = UDim2.new(0, 52, 1, 0), Position = UDim2.new(1, -52, 0, 0),
 			BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0,
 			AutoButtonColor = false, Font = FONT_B, TextSize = 13,
-		}, r)
+		}, row)
 		strokeOn(btn)
+		local name = labelText:gsub("%W", "_")
+		local chip = make("TextLabel", {
+			BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
+			Position = UDim2.new(1, -58, 0, 0), Size = UDim2.new(0, 48, 1, 0),
+			Font = Enum.Font.Code, TextSize = 12, TextColor3 = COLORS.TextMuted,
+			TextXAlignment = Enum.TextXAlignment.Right, Text = "[--]",
+		}, row)
 		local function refresh()
 			btn.Text = state[key] and "ON" or "OFF"
 			btn.TextColor3 = state[key] and COLORS.Active or COLORS.TextMuted
 		end
+		local function refreshChip()
+			local k = root:GetAttribute("Bind_" .. name)
+			chip.Text = "[" .. ((k and k ~= "") and k or "--") .. "]"
+			chip.TextColor3 = (k and k ~= "") and COLORS.Active or COLORS.TextMuted
+		end
 		refresh()
-		btn.MouseButton1Click:Connect(function()
+		refreshChip()
+		root:GetAttributeChangedSignal("Bind_" .. name):Connect(refreshChip)
+		local function activate()
 			state[key] = not state[key]
 			refresh()
-			if onChange then
-				onChange(state[key])
+			if onChange then onChange(state[key]) end
+		end
+		btn.MouseButton1Click:Connect(activate)
+		ui.registerRow(row, "row", activate, name)
+	end
+
+	function ui.varbox(labelText, state, key, minV, maxV, onSet)
+		local row = ui.row(22)
+		make("TextLabel", {
+			BackgroundTransparency = 1, Size = UDim2.new(1, -92, 1, 0),
+			Font = FONT_B, Text = labelText, TextSize = 14,
+			TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
+		}, row)
+		local box = make("TextBox", {
+			Size = UDim2.new(0, 84, 1, 0), Position = UDim2.new(1, -84, 0, 0),
+			BackgroundColor3 = COLORS.Background, BorderSizePixel = 0,
+			Font = FONT_B, Text = tostring(state[key]), TextSize = 13,
+			TextColor3 = COLORS.TextPrimary, ClearTextOnFocus = false,
+			TextXAlignment = Enum.TextXAlignment.Right,
+		}, row)
+		strokeOn(box)
+		make("UIPadding", { PaddingRight = UDim.new(0, 6) }, box)
+		box.FocusLost:Connect(function()
+			local n = tonumber(box.Text)
+			if n then
+				state[key] = math.clamp(n, minV, maxV)
+				if onSet then onSet(key) end
+			else
+				box.TextColor3 = Color3.fromRGB(255, 80, 80)
+				task.delay(0.4, function()
+					box.TextColor3 = COLORS.TextPrimary
+				end)
 			end
+			box.Text = tostring(state[key])
+		end)
+		if state.__varRefresh then
+			table.insert(state.__varRefresh, function()
+				box.Text = tostring(state[key])
+			end)
+		end
+		ui.registerRow(row, "varbox", function()
+			box:CaptureFocus()
 		end)
 	end
 
-	local function slider(labelText, state, key, minV, maxV, display)
-		local r = make("Frame", {
-			BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 30), LayoutOrder = nextOrder(),
-		}, content)
+	function ui.slider(labelText, state, key, minV, maxV, display)
+		local row = ui.row(30)
 		make("TextLabel", {
 			BackgroundTransparency = 1, Size = UDim2.new(1, -64, 0, 14),
 			Font = FONT_B, Text = labelText, TextSize = 14,
 			TextColor3 = COLORS.TextSecondary, TextXAlignment = Enum.TextXAlignment.Left,
-		}, r)
+		}, row)
 		local function text(v)
 			return display and display(v) or tostring(v)
 		end
@@ -217,21 +303,24 @@ runModule("Overseer", function(root)
 			Position = UDim2.new(1, -60, 0, 0), Font = FONT_B,
 			Text = text(state[key]), TextSize = 13, TextColor3 = COLORS.TextMuted,
 			TextXAlignment = Enum.TextXAlignment.Right,
-		}, r)
+		}, row)
 		local track = make("TextButton", {
 			Text = "", AutoButtonColor = false, BackgroundColor3 = COLORS.Background,
 			BorderSizePixel = 0, Size = UDim2.new(1, 0, 0, 6), Position = UDim2.new(0, 0, 0, 18),
-		}, r)
+		}, row)
 		strokeOn(track)
 		local fill = make("Frame", {
 			BackgroundColor3 = COLORS.Divider, BorderSizePixel = 0,
 			Size = UDim2.new((state[key] - minV) / (maxV - minV), 0, 1, 0),
 		}, track)
+		local function apply(v)
+			state[key] = math.clamp(v, minV, maxV)
+			val.Text = text(state[key])
+			fill.Size = UDim2.new((state[key] - minV) / (maxV - minV), 0, 1, 0)
+		end
 		local function setFromX(x)
 			local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
-			state[key] = math.floor(minV + rel * (maxV - minV) + 0.5)
-			val.Text = text(state[key])
-			fill.Size = UDim2.new(rel, 0, 1, 0)
+			apply(math.floor(minV + rel * (maxV - minV) + 0.5))
 		end
 		local sliding = false
 		track.InputBegan:Connect(function(input)
@@ -250,331 +339,719 @@ runModule("Overseer", function(root)
 				sliding = false
 			end
 		end)
+		ui.registerRow(row, "slider", nil, nil)
+		rows[#rows].adjust = apply
 	end
 
-	-- settings
-	local ovs = {
+	return ui
+end
+
+local function runModule(name, fn)
+	task.spawn(function()
+		local function attempt(bus)
+			if bus:GetAttribute("Mod_" .. name) then return end
+			bus:SetAttribute("Mod_" .. name, true)
+			local ok = xpcall(fn, function(e)
+				warn("[RemoteAdmin/" .. name .. "] failed: " .. tostring(e))
+				warn(debug.traceback(e))
+			end, bus)
+			if ok then
+				print("[RemoteAdmin/" .. name .. "] loaded")
+			end
+		end
+		local function hookBus(bus)
+			if bus:GetAttribute("Ready") then
+				attempt(bus)
+				return
+			end
+			local aconn
+			aconn = bus:GetAttributeChangedSignal("Ready"):Connect(function()
+				if bus:GetAttribute("Ready") then
+					aconn:Disconnect()
+					attempt(bus)
+				end
+			end)
+		end
+		local existing = ReplicatedStorage:FindFirstChild("RA_BUS")
+		if existing then hookBus(existing) end
+		ReplicatedStorage.ChildAdded:Connect(function(child)
+			if child.Name == "RA_BUS" then hookBus(child) end
+		end)
+	end)
+end
+
+-- ================================================================
+-- BIGHEAD
+-- ================================================================
+runModule("Bighead", function(root)
+	local hud, mainFrame, list, pages = resolveUI(root)
+	if not pages then
+		warn("[RemoteAdmin/Bighead] window structure not found")
+		return
+	end
+	local page = newCategory(root, list, pages, "BIGHEAD")
+	local ui = newTab(page, "BIGHEAD", root)
+	local statusLabel = ui.status()
+
+	local bh = {
 		enabled = false,
-		showPanels = true,
-		showPrediction = true,
-		onlyFlagged = false,
-		predTicks = 4,      -- x0.25s lead
-		speedFlag = 60,     -- studs/s
-		teleportDist = 35,  -- studs per detection tick
-		flyTime = 2,        -- seconds of sustained upward velocity
-		flagScore = 25,
+		scale = 10,
+		ghost = true,
+		ghostTransparency = 50,
+		includeMe = false,
+		scaleHats = true,
+		neckFix = true,
+		massless = true,
+		noCollide = true,
+		noTouch = true,
 	}
 
-	-- overlay gui
-	local ovsGui = Instance.new("ScreenGui")
-	ovsGui.Name = "RA_Overseer"
-	ovsGui.ResetOnSpawn = false
-	ovsGui.IgnoreGuiInset = true
-	ovsGui.DisplayOrder = 41
-	ovsGui.Parent = uiParent
+	local bhOrig = setmetatable({}, { __mode = "k" })
+	local bhNeck = setmetatable({}, { __mode = "k" })
 
-	local listHolder = make("Frame", {
-		AnchorPoint = Vector2.new(1, 0),
-		Position = UDim2.new(1, -10, 0, 10),
-		Size = UDim2.new(0, 215, 0, 0),
-		BackgroundTransparency = 1, BorderSizePixel = 0,
-		AutomaticSize = Enum.AutomaticSize.Y,
-	}, ovsGui)
-	make("UIListLayout", {
-		Padding = UDim.new(0, 4),
-		SortOrder = Enum.SortOrder.LayoutOrder,
-	}, listHolder)
-
-	local function scoreColor(score)
-		if score >= ovs.flagScore then
-			return Color3.fromRGB(255, 77, 77)
+	local function bhRemember(part)
+		if not bhOrig[part] then
+			bhOrig[part] = {
+				size = part.Size,
+				transparency = part.Transparency,
+				canCollide = part.CanCollide,
+				canTouch = part.CanTouch,
+				massless = part.Massless,
+			}
 		end
-		if score >= ovs.flagScore * 0.5 then
-			return Color3.fromRGB(255, 200, 60)
-		end
-		return Color3.fromRGB(96, 200, 96)
+		return bhOrig[part]
 	end
 
-	local data = {}
-
-	local function makePanel()
-		local f = make("Frame", {
-			Size = UDim2.new(1, 0, 0, 54),
-			BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0, Visible = false,
-		}, listHolder)
-		local str = make("UIStroke", { Color = COLORS.Divider, Thickness = 1, Transparency = 0.2 }, f)
-		local name = make("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 8, 0, 3),
-			Size = UDim2.new(1, -64, 0, 14), Font = Enum.Font.Code, TextSize = 12,
-			TextColor3 = COLORS.TextPrimary, TextXAlignment = Enum.TextXAlignment.Left,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-		}, f)
-		local score = make("TextLabel", {
-			BackgroundTransparency = 1, AnchorPoint = Vector2.new(1, 0),
-			Position = UDim2.new(1, -6, 0, 3), Size = UDim2.new(0, 52, 0, 14),
-			Font = Enum.Font.Code, TextSize = 12, TextColor3 = COLORS.TextMuted,
-			TextXAlignment = Enum.TextXAlignment.Right,
-		}, f)
-		local bar = make("Frame", {
-			Position = UDim2.new(0, 8, 0, 19), Size = UDim2.new(1, -16, 0, 3),
-			BackgroundColor3 = COLORS.Background, BorderSizePixel = 0,
-		}, f)
-		local fill = make("Frame", {
-			Size = UDim2.new(0, 0, 1, 0), BackgroundColor3 = COLORS.Active, BorderSizePixel = 0,
-		}, bar)
-		local info = make("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 8, 0, 25),
-			Size = UDim2.new(1, -16, 0, 12), Font = Enum.Font.Code, TextSize = 11,
-			TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-		}, f)
-		local flags = make("TextLabel", {
-			BackgroundTransparency = 1, Position = UDim2.new(0, 8, 0, 38),
-			Size = UDim2.new(1, -16, 0, 12), Font = Enum.Font.Code, TextSize = 11,
-			TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
-			TextTruncate = Enum.TextTruncate.AtEnd,
-		}, f)
-		return { frame = f, stroke = str, name = name, score = score, fill = fill, info = info, flags = flags }
-	end
-
-	local function makeDots()
-		local dots, strokes = {}, {}
-		for k = 1, 4 do
-			local big = (k == 4)
-			local dot = make("Frame", {
-				AnchorPoint = Vector2.new(0.5, 0.5),
-				Size = UDim2.fromOffset(big and 10 or 6, big and 10 or 6),
-				BackgroundTransparency = 1, BorderSizePixel = 0,
-				Rotation = 45, Visible = false, ZIndex = 5,
-			}, ovsGui)
-			strokes[k] = make("UIStroke", { Color = COLORS.Active, Thickness = 1 }, dot)
-			dots[k] = dot
-		end
-		return dots, strokes
-	end
-
-	local function ensure(plr)
-		if plr == LocalPlayer or data[plr] then return end
-		local dots, dotStrokes = makeDots()
-		data[plr] = {
-			panel = makePanel(), dots = dots, dotStrokes = dotStrokes,
-			cd = {}, recent = {}, score = 0, hits = 0,
-			char = nil, hasLast = false, lastPos = Vector3.zero,
-			spdT = 0, flyT = 0, hspeed = 0, vel = nil, pos = nil,
-			lastDetect = 0, lastPanel = 0, lastFlagAt = 0,
-		}
-	end
-
-	local function hideAll(d)
-		d.panel.frame.Visible = false
-		for _, dot in ipairs(d.dots) do
-			dot.Visible = false
-		end
-	end
-
-	local function flagEntry(d, code, pts)
-		local now = os.clock()
-		if d.cd[code] and now < d.cd[code] then return end
-		d.cd[code] = now + 2
-		d.score = math.min(d.score + pts, 100)
-		d.hits += 1
-		table.insert(d.recent, 1, code)
-		if #d.recent > 4 then
-			table.remove(d.recent)
-		end
-		d.lastFlagAt = now
-	end
-
-	local function resetTrackers()
-		for _, d in pairs(data) do
-			d.hasLast = false
-			d.spdT = 0
-			d.flyT = 0
-			d.score = 0
-			d.recent = {}
-			d.cd = {}
-			hideAll(d)
-		end
-	end
-
-	for _, plr in ipairs(Players:GetPlayers()) do
-		ensure(plr)
-	end
-	Players.PlayerAdded:Connect(ensure)
-	Players.PlayerRemoving:Connect(function(plr)
-		local d = data[plr]
-		if d then
-			d.panel.frame:Destroy()
-			for _, dot in ipairs(d.dots) do
-				dot:Destroy()
+	local function bhNeckFor(char)
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("Motor6D") and d.Name == "Neck" then
+				return d
 			end
-			data[plr] = nil
 		end
-	end)
+		return nil
+	end
 
-	local statusUpd = 0
-	local renderConn = RunService.RenderStepped:Connect(function(dt)
-		local cam = workspace.CurrentCamera
-		local now = os.clock()
-		if not ovs.enabled or not cam then
-			for _, d in pairs(data) do
-				hideAll(d)
-			end
+	local function bhApplyChar(char, active)
+		local head = char:FindFirstChild("Head")
+		if not (head and head:IsA("BasePart")) then
 			return
 		end
-		dt = math.clamp(dt, 0.01, 0.1)
-		local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
-		local tracked, flagged = 0, 0
+		local o = bhRemember(head)
+		local scale = active and bh.scale or 1
 
-		for plr, d in pairs(data) do
-			local char = plr.Character
-			if char ~= d.char then
-				d.char = char
-				d.hasLast = false
-				d.spdT = 0
-				d.flyT = 0
+		pcall(function()
+			local target = o.size * scale
+			if head.Size ~= target then
+				head.Size = target
 			end
-			local hum = char and char:FindFirstChildOfClass("Humanoid")
-			local ro = char and char:FindFirstChild("HumanoidRootPart")
-			local alive = (hum and ro and hum.Health > 0) and true or false
+			local wantT = (active and bh.ghost) and (bh.ghostTransparency / 100) or o.transparency
+			if head.Transparency ~= wantT then
+				head.Transparency = wantT
+			end
+			local wantC = (active and bh.noCollide) and false or o.canCollide
+			if head.CanCollide ~= wantC then
+				head.CanCollide = wantC
+			end
+			local wantK = (active and bh.noTouch) and false or o.canTouch
+			if head.CanTouch ~= wantK then
+				head.CanTouch = wantK
+			end
+			local wantM = (active and bh.massless) and true or o.massless
+			if head.Massless ~= wantM then
+				head.Massless = wantM
+			end
+		end)
 
-			if alive then
-				tracked += 1
-				local pos = ro.Position
-				local vel = ro.AssemblyLinearVelocity
+		local motor = bhNeckFor(char)
+		if motor then
+			local entry = bhNeck[motor]
+			if not entry then
+				entry = { c0 = motor.C0 }
+				bhNeck[motor] = entry
+			end
+			local want
+			if active and bh.neckFix then
+				want = entry.c0 * CFrame.new(0, (bh.scale - 1) * (o.size.Y / 2), 0)
+			else
+				want = entry.c0
+			end
+			if motor.C0 ~= want then
+				pcall(function()
+					motor.C0 = want
+				end)
+			end
+		end
 
-				-- anomaly detection at ~16Hz
-				if now - d.lastDetect >= 0.06 then
-					local ddt = math.clamp(now - d.lastDetect, 0.01, 0.25)
-					d.lastDetect = now
-
-					if d.hasLast then
-						local disp = (pos - d.lastPos).Magnitude
-						if disp > ovs.teleportDist then
-							flagEntry(d, "TP", 25)
+		for _, acc in ipairs(char:GetChildren()) do
+			if acc:IsA("Accessory") then
+				local handle = acc:FindFirstChild("Handle")
+				if handle then
+					local att = handle:FindFirstChildWhichIsA("Attachment")
+					if att and (att.Name == "HatAttachment" or string.find(att.Name, "Head") ~= nil) then
+						local ho = bhRemember(handle)
+						local wantSize = (active and bh.scaleHats) and ho.size * bh.scale or ho.size
+						if handle.Size ~= wantSize then
+							pcall(function()
+								handle.Size = wantSize
+							end)
 						end
 					end
-					d.lastPos = pos
-					d.hasLast = true
-
-					local hs = Vector3.new(vel.X, 0, vel.Z).Magnitude
-					d.hspeed = hs
-					if hs > ovs.speedFlag then
-						d.spdT += ddt
-					else
-						d.spdT = math.max(0, d.spdT - ddt)
-					end
-					if d.spdT > 0.4 then
-						flagEntry(d, "SPD", 8)
-					end
-
-					if vel.Y > 25 then
-						d.flyT += ddt
-					else
-						d.flyT = 0
-					end
-					if d.flyT > ovs.flyTime then
-						flagEntry(d, "FLY", 12)
-					end
-
-					-- suspicion cools off when clean
-					if now - d.lastFlagAt > 1.5 then
-						d.score = math.max(0, d.score - 20 * ddt)
-					end
 				end
-
-				d.pos = pos
-				d.vel = vel
-				if d.score >= ovs.flagScore then
-					flagged += 1
-				end
-			else
-				d.hasLast = false
-			end
-
-			-- prediction markers
-			local showDots = ovs.showPrediction and alive and d.pos and d.vel and d.vel.Magnitude > 6
-			local lead = ovs.predTicks / 4
-			for k = 1, 4 do
-				local dot = d.dots[k]
-				if not showDots then
-					dot.Visible = false
-				else
-					local wp = d.pos + d.vel * (lead * k / 4)
-					local ok, pt = pcall(function()
-						return cam:WorldToViewportPoint(wp)
-					end)
-					if ok and pt.Z > 0 then
-						dot.Visible = true
-						dot.Position = UDim2.fromOffset(pt.X, pt.Y)
-						d.dotStrokes[k].Color = scoreColor(d.score)
-					else
-						dot.Visible = false
-					end
-				end
-			end
-
-			-- panel at 4Hz, sorted by suspicion
-			if now - d.lastPanel >= 0.25 then
-				d.lastPanel = now
-				local dist = nil
-				if myRoot and d.pos then
-					dist = (d.pos - myRoot.Position).Magnitude
-				end
-				d.panel.name.Text = string.upper(plr.DisplayName)
-				d.panel.score.Text = tostring(math.floor(d.score + 0.5))
-				d.panel.info.Text = string.format("SPD %3.0f%s  HITS %d",
-					d.hspeed,
-					dist and string.format("  DST %dm", math.floor(dist + 0.5)) or "",
-					d.hits)
-				d.panel.flags.Text = (#d.recent > 0) and table.concat(d.recent, "+") or "clear"
-				d.panel.fill.Size = UDim2.new(math.clamp(d.score / 100, 0, 1), 0, 1, 0)
-				local col = scoreColor(d.score)
-				d.panel.stroke.Color = col
-				d.panel.fill.BackgroundColor3 = col
-				d.panel.frame.LayoutOrder = math.floor(1000 - d.score)
-				d.panel.frame.Visible = ovs.showPanels and alive
-					and (not ovs.onlyFlagged or d.score >= ovs.flagScore)
 			end
 		end
+	end
 
-		if now - statusUpd >= 1 then
-			statusUpd = now
-			statusLabel.Text = "STATUS  tracking " .. tracked .. " | flagged " .. flagged
-			statusLabel.TextColor3 = (flagged > 0) and COLORS.Active or COLORS.TextMuted
+	local function bhRestoreAll()
+		for part, o in pairs(bhOrig) do
+			pcall(function()
+				part.Size = o.size
+				part.Transparency = o.transparency
+				part.CanCollide = o.canCollide
+				part.CanTouch = o.canTouch
+				part.Massless = o.massless
+			end)
+		end
+		table.clear(bhOrig)
+		for motor, entry in pairs(bhNeck) do
+			pcall(function()
+				motor.C0 = entry.c0
+			end)
+		end
+		table.clear(bhNeck)
+	end
+
+	local renderConn = RunService.RenderStepped:Connect(function()
+		if not bh.enabled then return end
+		for _, plr in ipairs(Players:GetPlayers()) do
+			local char = plr.Character
+			if char then
+				bhApplyChar(char, bh.includeMe or plr ~= LocalPlayer)
+			end
 		end
 	end)
 
-	-- tab controls
-	local masterBtn = button("ENABLE OVERSEER", 32)
-	masterBtn.MouseButton1Click:Connect(function()
-		ovs.enabled = not ovs.enabled
-		resetTrackers()
-		masterBtn.Text = ovs.enabled and "DISABLE OVERSEER" or "ENABLE OVERSEER"
-		masterBtn.TextColor3 = ovs.enabled and COLORS.Active or COLORS.TextSecondary
+	local function refreshStatus()
+		if bh.enabled then
+			statusLabel.Text = "STATUS  active, x" .. bh.scale
+			statusLabel.TextColor3 = COLORS.Active
+		else
+			statusLabel.Text = "STATUS  idle"
+			statusLabel.TextColor3 = COLORS.TextMuted
+		end
+	end
+
+	ui.button("ENABLE BIGHEAD", 32, function()
+		bh.enabled = not bh.enabled
+		if not bh.enabled then
+			bhRestoreAll()
+		end
+		refreshStatus()
 	end)
 
-	section("DETECTION")
-	toggle("Show Panels", ovs, "showPanels")
-	toggle("Only Flagged", ovs, "onlyFlagged")
-	slider("Speed Flag (studs/s)", ovs, "speedFlag", 20, 200)
-	slider("Teleport Flag (studs)", ovs, "teleportDist", 10, 150)
-	slider("Fly Time (s)", ovs, "flyTime", 1, 5)
-	slider("Flag Threshold", ovs, "flagScore", 5, 100)
+	ui.section("OPTIONS")
+	ui.toggle("Include Me", bh, "includeMe")
+	ui.toggle("Scale Hats", bh, "scaleHats")
+	ui.toggle("Neck Offset", bh, "neckFix")
+	ui.toggle("Ghost Head", bh, "ghost")
+	ui.toggle("Massless", bh, "massless")
+	ui.toggle("No Collide", bh, "noCollide")
+	ui.toggle("No Touch", bh, "noTouch")
 
-	section("PREDICTION")
-	toggle("Show Prediction", ovs, "showPrediction")
-	slider("Prediction Lead", ovs, "predTicks", 1, 12, function(v)
-		return string.format("%.2fs", v / 4)
+	ui.section("VALUES")
+	ui.slider("Head Scale", bh, "scale", 1, 25)
+	ui.slider("Ghost Transparency", bh, "ghostTransparency", 0, 100, function(v)
+		return v .. "%"
 	end)
-
-	section("LEGEND")
-	label("TP  position jump   SPD  overspeed")
-	label("FLY  sustained vertical thrust")
-	label("score decays while a player behaves")
 
 	root.Destroying:Connect(function()
 		renderConn:Disconnect()
-		ovsGui:Destroy()
+		bhRestoreAll()
 	end)
+end)
+
+-- ================================================================
+-- MISC
+-- ================================================================
+runModule("Misc", function(root)
+	local hud, mainFrame, list, pages = resolveUI(root)
+	if not pages then
+		warn("[RemoteAdmin/Misc] window structure not found")
+		return
+	end
+	local page = newCategory(root, list, pages, "MISC")
+	local ui = newTab(page, "MISC", root)
+	local statusLabel = ui.status()
+
+	local misc = {
+		cyber = false, cyberPower = 8,
+		antiLook = false, antiLookDot = 97, antiLookDist = 150, antiLookCD = 25,
+		noclip = false,
+		spin = false, spinSpeed = 40,
+		flicker = false, flickerRate = 10,
+	}
+
+	local conns = {}
+	local dodgeFlip = false
+	local antiLookNext = 0
+	local flickerAcc = 0
+	local flickerSnap = nil
+
+	local function activeList()
+		local t = {}
+		if misc.cyber then table.insert(t, "cyber") end
+		if misc.antiLook then table.insert(t, "anti-look") end
+		if misc.noclip then table.insert(t, "noclip") end
+		if misc.spin then table.insert(t, "spin") end
+		if misc.flicker then table.insert(t, "flicker") end
+		if #t == 0 then return nil end
+		return table.concat(t, "+")
+	end
+
+	local function refreshStatus()
+		local a = activeList()
+		statusLabel.Text = "STATUS  " .. (a or "idle")
+		statusLabel.TextColor3 = a and COLORS.Active or COLORS.TextMuted
+	end
+
+	local function startFlicker()
+		local char = LocalPlayer.Character
+		if not char then return end
+		flickerSnap = {}
+		for _, d in ipairs(char:GetDescendants()) do
+			if d:IsA("BasePart") and d.Transparency < 1 then
+				flickerSnap[d] = d.Transparency
+			end
+		end
+	end
+
+	local function stopFlicker()
+		if flickerSnap then
+			for part, t in pairs(flickerSnap) do
+				pcall(function()
+					part.Transparency = t
+				end)
+			end
+			flickerSnap = nil
+		end
+	end
+
+	local rayParams = RaycastParams.new()
+	rayParams.FilterType = Enum.RaycastFilterType.Exclude
+	rayParams.RespectCanCollide = true
+
+	RunService:BindToRenderStep("RA_misc", Enum.RenderPriority.Camera.Value + 1, function(dt)
+		dt = math.clamp(dt, 0.001, 0.1)
+		local char = LocalPlayer.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local ro = char and char:FindFirstChild("HumanoidRootPart")
+		local cam = workspace.CurrentCamera
+		if not (char and hum and ro and cam) then return end
+		if hum.Health <= 0 then return end
+
+		if misc.cyber and not hum.SeatPart then
+			local amp = misc.cyberPower / 100
+			local ang = math.random() * math.pi * 2
+			local r = math.random() * amp
+			ro.CFrame = ro.CFrame * CFrame.new(math.cos(ang) * r, 0, math.sin(ang) * r)
+		end
+
+		if misc.antiLook and not hum.SeatPart then
+			local now = os.clock()
+			if now >= antiLookNext then
+				local myHead = char:FindFirstChild("Head")
+				for _, plr in ipairs(Players:GetPlayers()) do
+					if plr ~= LocalPlayer then
+						local c = plr.Character
+						local h = c and c:FindFirstChildOfClass("Humanoid")
+						local head = c and c:FindFirstChild("Head")
+						local proot = c and c:FindFirstChild("HumanoidRootPart")
+						if h and head and proot and h.Health > 0 then
+							local toMe = ro.Position - head.Position
+							local dist = toMe.Magnitude
+							if dist > 0.5 and dist <= misc.antiLookDist then
+								if head.CFrame.LookVector:Dot(toMe.Unit) >= misc.antiLookDot / 100 then
+									local filter = { c, char, cam }
+									rayParams.FilterDescendantsInstances = filter
+									local blocked = workspace:Raycast(head.Position, toMe, rayParams) ~= nil
+									if not blocked and myHead then
+										blocked = workspace:Raycast(head.Position, myHead.Position - head.Position, rayParams) ~= nil
+									end
+									if not blocked then
+										local flat = Vector3.new(toMe.X, 0, toMe.Z)
+										if flat.Magnitude > 0.01 then
+											flat = flat.Unit
+											local perp = Vector3.new(-flat.Z, 0, flat.X)
+											dodgeFlip = not dodgeFlip
+											ro.CFrame += (dodgeFlip and perp or -perp)
+											antiLookNext = now + misc.antiLookCD / 100
+											break
+										end
+									end
+								end
+							end
+						end
+					end
+				end
+			end
+		end
+
+		if misc.noclip and not hum.SeatPart then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("BasePart") then
+					d.CanCollide = false
+				end
+			end
+		end
+
+		if misc.spin and not hum.SeatPart then
+			ro.AssemblyAngularVelocity = Vector3.new(0, misc.spinSpeed, 0)
+		end
+
+		if misc.flicker and flickerSnap then
+			flickerAcc += dt
+			local interval = 1 / math.max(misc.flickerRate, 1)
+			if flickerAcc >= interval then
+				flickerAcc = 0
+				local target = (math.random() < 0.5) and 1 or 0
+				for part in pairs(flickerSnap) do
+					pcall(function()
+						part.Transparency = target
+					end)
+				end
+			end
+		end
+	end)
+
+	local function onToggles(key, v)
+		if key == "flicker" then
+			if v then
+				startFlicker()
+			else
+				stopFlicker()
+			end
+		end
+		if key == "noclip" and not v then
+			local char = LocalPlayer.Character
+			if char then
+				for _, d in ipairs(char:GetDescendants()) do
+					if d:IsA("BasePart") then
+						d.CanCollide = true
+					end
+				end
+			end
+		end
+		if key == "spin" and not v then
+			local char = LocalPlayer.Character
+			local ro = char and char:FindFirstChild("HumanoidRootPart")
+			if ro then
+				ro.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+		refreshStatus()
+	end
+
+	ui.section("MIND")
+	ui.toggle("Cyberpsychosis", misc, "cyber", onToggles)
+	ui.slider("Jitter Power", misc, "cyberPower", 1, 60)
+	ui.toggle("Ghost Flicker", misc, "flicker", onToggles)
+	ui.slider("Flicker Rate", misc, "flickerRate", 2, 30)
+
+	ui.section("DEFENSE")
+	ui.toggle("Anti-Look Dodge", misc, "antiLook", onToggles)
+	ui.slider("Aim Cone", misc, "antiLookDot", 90, 100, function(v)
+		return v .. "%"
+	end)
+	ui.slider("Range", misc, "antiLookDist", 25, 500)
+	ui.slider("Dodge Cooldown", misc, "antiLookCD", 5, 100, function(v)
+		return string.format("%.2fs", v / 100)
+	end)
+
+	ui.section("TRICKS")
+	ui.toggle("Noclip", misc, "noclip", onToggles)
+	ui.toggle("Spin", misc, "spin", onToggles)
+	ui.slider("Spin Speed", misc, "spinSpeed", 5, 100)
+
+	ui.label("anti-look reads body facing, enemy cameras are not visible client side")
+
+	table.insert(conns, LocalPlayer.CharacterAdded:Connect(function()
+		antiLookNext = 0
+		if misc.flicker then
+			task.wait(0.5)
+			if misc.flicker then
+				startFlicker()
+			end
+		end
+	end))
+
+	root.Destroying:Connect(function()
+		for _, c in ipairs(conns) do
+			c:Disconnect()
+		end
+		stopFlicker()
+		pcall(function()
+			RunService:UnbindFromRenderStep("RA_misc")
+		end)
+		local char = LocalPlayer.Character
+		if char then
+			for _, d in ipairs(char:GetDescendants()) do
+				if d:IsA("BasePart") then
+					d.CanCollide = true
+				end
+			end
+			local ro = char:FindFirstChild("HumanoidRootPart")
+			if ro then
+				ro.AssemblyAngularVelocity = Vector3.zero
+			end
+		end
+	end)
+end)
+
+-- ================================================================
+-- USER CHECKER
+-- ================================================================
+runModule("UserChecker", function(root)
+	local hud, mainFrame, list, pages = resolveUI(root)
+	if not pages then
+		warn("[RemoteAdmin/UserChecker] window structure not found")
+		return
+	end
+	local page = newCategory(root, list, pages, "USER CHECKER")
+	local ui = newTab(page, "USER CHECKER", root)
+
+	local state = { autoRefresh = true }
+
+	local headRow = ui.row(104)
+	local thumb = make("ImageLabel", {
+		Size = UDim2.fromOffset(96, 96), Position = UDim2.new(0, 0, 0, 4),
+		BackgroundColor3 = COLORS.Panel, Image = "", ScaleType = Enum.ScaleType.Fit,
+	}, headRow)
+	strokeOn(thumb)
+
+	local nameBig = make("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.new(0, 106, 0, 4),
+		Size = UDim2.new(1, -106, 0, 24), Font = FONT_H,
+		Text = "no player selected", TextSize = 20, TextColor3 = COLORS.TextMuted,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, headRow)
+
+	local nameSmall = make("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.new(0, 106, 0, 30),
+		Size = UDim2.new(1, -106, 0, 16), Font = FONT_B,
+		Text = "click someone in the player list", TextSize = 13,
+		TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
+	}, headRow)
+
+	local riskLabel = make("TextLabel", {
+		BackgroundTransparency = 1, Position = UDim2.new(0, 106, 0, 50),
+		Size = UDim2.new(1, -106, 0, 16), Font = FONT_B,
+		Text = "SMURF RISK  -", TextSize = 13, TextColor3 = COLORS.TextMuted,
+		TextXAlignment = Enum.TextXAlignment.Left,
+	}, headRow)
+
+	local valueLabels = {}
+	local function infoRow(labelText)
+		local r = ui.row(18)
+		make("TextLabel", {
+			BackgroundTransparency = 1, Size = UDim2.new(0.5, 0, 1, 0),
+			Font = FONT_B, Text = labelText, TextSize = 13,
+			TextColor3 = COLORS.TextMuted, TextXAlignment = Enum.TextXAlignment.Left,
+		}, r)
+		local val = make("TextLabel", {
+			BackgroundTransparency = 1, Position = UDim2.new(0.5, 0, 0, 0),
+			Size = UDim2.new(0.5, 0, 1, 0), Font = Enum.Font.Code,
+			Text = "-", TextSize = 12, TextColor3 = COLORS.TextSecondary,
+			TextXAlignment = Enum.TextXAlignment.Right, TextTruncate = Enum.TextTruncate.AtEnd,
+		}, r)
+		valueLabels[labelText] = val
+	end
+
+	ui.section("PROFILE")
+	infoRow("User ID")
+	infoRow("Account Age")
+	infoRow("Created (est)")
+	infoRow("Verified Badge")
+	infoRow("Premium")
+	infoRow("Friends With You")
+	infoRow("Team")
+	infoRow("Time In Server")
+
+	ui.section("LIVE")
+	infoRow("Health")
+	infoRow("WalkSpeed")
+	infoRow("Speed")
+	infoRow("Position")
+	infoRow("Distance")
+	infoRow("Ping")
+	infoRow("Tool")
+	infoRow("Seated")
+
+	ui.toggle("Auto Refresh", state, "autoRefresh")
+
+	local focused = nil
+	local joinedAt = {}
+	for _, plr in ipairs(Players:GetPlayers()) do
+		joinedAt[plr] = os.clock()
+	end
+	local addedConn = Players.PlayerAdded:Connect(function(plr)
+		joinedAt[plr] = os.clock()
+	end)
+
+	local function set(name, text, color)
+		local lbl = valueLabels[name]
+		if not lbl then return end
+		lbl.Text = tostring(text)
+		lbl.TextColor3 = color or COLORS.TextSecondary
+	end
+
+	local function clearAll()
+		nameBig.Text = "no player selected"
+		nameBig.TextColor3 = COLORS.TextMuted
+		nameSmall.Text = "click someone in the player list"
+		riskLabel.Text = "SMURF RISK  -"
+		riskLabel.TextColor3 = COLORS.TextMuted
+		thumb.Image = ""
+		for name in pairs(valueLabels) do
+			set(name, "-")
+		end
+	end
+
+	local function refreshProfile()
+		if not focused then
+			clearAll()
+			return
+		end
+		local plr = focused
+		nameBig.Text = plr.DisplayName
+		nameBig.TextColor3 = COLORS.TextPrimary
+		nameSmall.Text = "@" .. plr.Name .. "  (" .. plr.UserId .. ")"
+
+		local age = plr.AccountAge
+		set("User ID", plr.UserId)
+		set("Account Age", string.format("%dd (~%.1f y)", age, age / 365))
+		set("Created (est)", os.date("%Y-%m-%d", os.time() - age * 86400))
+		set("Verified Badge", plr.HasVerifiedBadge and "YES" or "NO",
+			plr.HasVerifiedBadge and COLORS.Active or nil)
+		set("Premium", (plr.MembershipType == Enum.MembershipType.Premium) and "YES"
+			or tostring(plr.MembershipType))
+		set("Team", plr.Team and plr.Team.Name or "none",
+			plr.Team and plr.TeamColor.Color or nil)
+
+		local risk, rcolor
+		if age < 30 then
+			risk, rcolor = "HIGH", Color3.fromRGB(255, 77, 77)
+		elseif age < 90 then
+			risk, rcolor = "MEDIUM", Color3.fromRGB(255, 152, 0)
+		elseif age < 365 then
+			risk, rcolor = "LOW", Color3.fromRGB(230, 200, 80)
+		else
+			risk, rcolor = "MINIMAL", Color3.fromRGB(96, 255, 96)
+		end
+		riskLabel.Text = "SMURF RISK  " .. risk
+		riskLabel.TextColor3 = rcolor
+
+		task.spawn(function()
+			local ok, result = pcall(function()
+				return LocalPlayer:IsFriendsWith(plr.UserId)
+			end)
+			if focused == plr then
+				set("Friends With You", ok and (result and "YES" or "NO") or "?",
+					(ok and result) and COLORS.Active or nil)
+			end
+		end)
+
+		task.spawn(function()
+			local ok, img = pcall(function()
+				return Players:GetUserThumbnailAsync(plr.UserId,
+					Enum.ThumbnailType.HeadShot, Enum.ThumbnailSize.Size100x100)
+			end)
+			if ok and focused == plr then
+				thumb.Image = img
+			end
+		end)
+	end
+
+	local function refreshLive()
+		if not focused then return end
+		local plr = focused
+		local char = plr.Character
+		local hum = char and char:FindFirstChildOfClass("Humanoid")
+		local ro = char and char:FindFirstChild("HumanoidRootPart")
+
+		if hum then
+			set("Health", string.format("%.0f / %.0f", hum.Health, hum.MaxHealth),
+				(hum.Health / math.max(hum.MaxHealth, 1) < 0.3) and Color3.fromRGB(255, 77, 77) or nil)
+			set("WalkSpeed", string.format("%.0f", hum.WalkSpeed))
+		else
+			set("Health", "dead / loading", Color3.fromRGB(255, 77, 77))
+			set("WalkSpeed", "-")
+		end
+
+		if ro then
+			local p = ro.Position
+			set("Position", string.format("%.0f, %.0f, %.0f", p.X, p.Y, p.Z))
+			set("Speed", string.format("%.1f", ro.AssemblyLinearVelocity.Magnitude))
+			local myRoot = LocalPlayer.Character and LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+			if myRoot then
+				set("Distance", string.format("%.0f studs", (p - myRoot.Position).Magnitude))
+			else
+				set("Distance", "-")
+			end
+		else
+			set("Position", "-")
+			set("Speed", "-")
+			set("Distance", "-")
+		end
+
+		task.spawn(function()
+			local ok, ping = pcall(function()
+				return plr:GetNetworkPing()
+			end)
+			if focused == plr then
+				set("Ping", ok and string.format("%d ms", ping * 1000) or "?")
+			end
+		end)
+
+		local tool = char and char:FindFirstChildOfClass("Tool")
+		set("Tool", tool and tool.Name or "-")
+		local seat = hum and hum.SeatPart
+		set("Seated", seat and seat.Parent and seat.Parent.Name or "-")
+
+		local joined = joinedAt[plr]
+		if joined then
+			set("Time In Server", string.format("%dm %ds", (os.clock() - joined) / 60, (os.clock() - joined) % 60))
+		end
+	end
+
+	local focusConn = root:WaitForChild("FocusEvent").Event:Connect(function(plr)
+		focused = plr
+		refreshProfile()
+		if plr then
+			local sf = root:FindFirstChild("SelectCategory")
+			if sf then
+				sf:Invoke("USER CHECKER")
+			end
+		end
+	end)
+
+	local acc = 0
+	local hb = RunService.Heartbeat:Connect(function(dt)
+		acc += dt
+		if acc < 0.5 then return end
+		acc = 0
+		if focused and not focused.Parent then
+			focused = nil
+			refreshProfile()
+		end
+		if state.autoRefresh then
+			refreshLive()
+		end
+	end)
+
+	root.Destroying:Connect(function()
+		focusConn:Disconnect()
+		hb:Disconnect()
+		addedConn:Disconnect()
+	end)
+
+	clearAll()
 end)
