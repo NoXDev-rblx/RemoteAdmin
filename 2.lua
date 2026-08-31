@@ -1,5 +1,6 @@
 ----------------------------------------------------------------
--- remote admin 4.6.1 :: file 2/4 :: movement + spectator
+-- remote admin 5.2 :: file 2/5 :: movement + spectator
+-- install beside main.lua (file 1); runs only if its AllowedUserIds gate passes
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
@@ -7,7 +8,40 @@ local UserInputService = game:GetService("UserInputService")
 local SoundService = game:GetService("SoundService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
-local uiParent = LocalPlayer and (LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10))
+do
+    local t0 = os.clock()
+    while not LocalPlayer and os.clock() - t0 < 10 do
+        task.wait(0.1)
+        LocalPlayer = Players.LocalPlayer
+    end
+end
+assert(LocalPlayer, "[RemoteAdmin] file 2: no LocalPlayer, client only")
+local uiParent = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+assert(uiParent, "[RemoteAdmin] file 2: PlayerGui never appeared")
+
+----------------------------------------------------------------
+-- GATE: main.lua (file 1) creates the shared RA_BUS only after its
+-- AllowedUserIds check passes. No bus here = this client is not an
+-- admin: stand down so none of this file's modules ever run.
+----------------------------------------------------------------
+local function gateClosed()
+    if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+        return true
+    end
+    local t0 = os.clock()
+    while not ReplicatedStorage:FindFirstChild("RA_BUS") and os.clock() - t0 < 30 do
+        if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+            return true
+        end
+        task.wait(0.25)
+    end
+    return not ReplicatedStorage:FindFirstChild("RA_BUS")
+end
+
+if gateClosed() then
+    print("[RemoteAdmin] file 2: admin gate closed (not on AllowedUserIds) - standing down")
+    return
+end
 
 local COLORS = {
     Background    = Color3.fromRGB(13, 13, 13),
@@ -299,7 +333,7 @@ local function newTab(page, pageName, root)
         end)
     end
 
-    function ui.slider(labelText, state, key, minV, maxV, display)
+    function ui.slider(labelText, state, key, minV, maxV, display, onSet)
         local row = ui.row(30)
         make("TextLabel", {
             BackgroundTransparency = 1, Size = UDim2.new(1, -64, 0, 14),
@@ -328,6 +362,7 @@ local function newTab(page, pageName, root)
             state[key] = math.clamp(v, minV, maxV)
             val.Text = text(state[key])
             fill.Size = UDim2.new((state[key] - minV) / (maxV - minV), 0, 1, 0)
+            if onSet then onSet(state[key]) end
         end
         local function setFromX(x)
             local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
