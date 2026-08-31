@@ -1,12 +1,46 @@
 ----------------------------------------------------------------
--- remote admin 4.7 :: file 4/4 :: bighead + misc + user checker + mod tools
+-- remote admin 5.2 :: file 4/5 :: bighead + misc + user checker + mod tools
+-- install beside main.lua (file 1); runs only if its AllowedUserIds gate passes
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
-local uiParent = LocalPlayer and (LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10))
+do
+    local t0 = os.clock()
+    while not LocalPlayer and os.clock() - t0 < 10 do
+        task.wait(0.1)
+        LocalPlayer = Players.LocalPlayer
+    end
+end
+assert(LocalPlayer, "[RemoteAdmin] file 4: no LocalPlayer, client only")
+local uiParent = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+assert(uiParent, "[RemoteAdmin] file 4: PlayerGui never appeared")
+
+----------------------------------------------------------------
+-- GATE: main.lua (file 1) creates the shared RA_BUS only after its
+-- AllowedUserIds check passes. No bus here = this client is not an
+-- admin: stand down so none of this file's modules ever run.
+----------------------------------------------------------------
+local function gateClosed()
+    if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+        return true
+    end
+    local t0 = os.clock()
+    while not ReplicatedStorage:FindFirstChild("RA_BUS") and os.clock() - t0 < 30 do
+        if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+            return true
+        end
+        task.wait(0.25)
+    end
+    return not ReplicatedStorage:FindFirstChild("RA_BUS")
+end
+
+if gateClosed() then
+    print("[RemoteAdmin] file 4: admin gate closed (not on AllowedUserIds) - standing down")
+    return
+end
 
 local COLORS = {
     Background    = Color3.fromRGB(13, 13, 13),
@@ -348,7 +382,7 @@ local function newTab(page, pageName, root)
         end)
     end
 
-    function ui.slider(labelText, state, key, minV, maxV, display)
+    function ui.slider(labelText, state, key, minV, maxV, display, onSet)
         local row = ui.row(30)
         make("TextLabel", {
             BackgroundTransparency = 1, Size = UDim2.new(1, -64, 0, 14),
@@ -377,6 +411,7 @@ local function newTab(page, pageName, root)
             state[key] = math.clamp(v, minV, maxV)
             val.Text = text(state[key])
             fill.Size = UDim2.new((state[key] - minV) / (maxV - minV), 0, 1, 0)
+            if onSet then onSet(state[key]) end
         end
         local function setFromX(x)
             local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
@@ -441,7 +476,7 @@ local function runModule(name, fn)
 end
 
 -- ================================================================
--- BIGHEAD
+-- BIGHEAD  (5.0 rewrite: studs based, force apply, safe restore)
 -- ================================================================
 runModule("Bighead", function(root)
     local hud, mainFrame, list, pages = resolveUI(root)
@@ -453,9 +488,14 @@ runModule("Bighead", function(root)
     local ui = newTab(page, "BIGHEAD", root)
     local statusLabel = ui.status()
 
+    local function setStatus(text, color)
+        statusLabel.Text = "STATUS  " .. tostring(text)
+        statusLabel.TextColor3 = color or COLORS.TextSecondary
+    end
+
     local bh = {
         enabled = false,
-        scale = 10,
+        headStuds = 2,          -- THE editable value: head becomes stud x stud x stud
         ghost = true,
         ghostTransparency = 50,
         includeMe = false,
@@ -465,19 +505,27 @@ runModule("Bighead", function(root)
         noCollide = true,
         noTouch = true,
     }
+    bh.__varRefresh = {}
 
+    -- weak keyed: entries vanish automatically once parts are destroyed
     local bhOrig = setmetatable({}, { __mode = "k" })
     local bhNeck = setmetatable({}, { __mode = "k" })
 
     local function bhRemember(part)
         if not bhOrig[part] then
-            bhOrig[part] = {
+            local o = {
                 size = part.Size,
                 transparency = part.Transparency,
                 canCollide = part.CanCollide,
                 canTouch = part.CanTouch,
                 massless = part.Massless,
             }
+            local mesh = part:FindFirstChildOfClass("SpecialMesh")
+            if mesh then
+                o.mesh = mesh
+                o.meshScale = mesh.Scale
+            end
+            bhOrig[part] = o
         end
         return bhOrig[part]
     end
@@ -491,18 +539,41 @@ runModule("Bighead", function(root)
         return nil
     end
 
+    local function bhRestorePart(part, o)
+        pcall(function()
+            if o.mesh then
+                o.mesh.Scale = o.meshScale
+            end
+            part.Size = o.size
+            part.Transparency = o.transparency
+            part.CanCollide = o.canCollide
+            part.CanTouch = o.canTouch
+            part.Massless = o.massless
+        end)
+    end
+
+    -- active = grow head to bh.headStuds cube, inactive = exact original back.
+    -- Meshes (R6/R15 head meshes) are scaled by the same ratio so the visual
+    -- size really matches the chosen stud value on both rig types.
     local function bhApplyChar(char, active)
         local head = char:FindFirstChild("Head")
         if not (head and head:IsA("BasePart")) then
             return
         end
         local o = bhRemember(head)
-        local scale = active and bh.scale or 1
+        local s = active and bh.headStuds or o.size.X
+        local ratio = s / math.max(o.size.X, 0.01)
 
         pcall(function()
-            local target = o.size * scale
-            if head.Size ~= target then
-                head.Size = target
+            local wantSize = Vector3.new(s, s, s)
+            if head.Size ~= wantSize then
+                head.Size = wantSize
+            end
+            if o.mesh then
+                local wantScale = o.meshScale * ratio
+                if o.mesh.Scale ~= wantScale then
+                    o.mesh.Scale = wantScale
+                end
             end
             local wantT = (active and bh.ghost) and (bh.ghostTransparency / 100) or o.transparency
             if head.Transparency ~= wantT then
@@ -531,7 +602,10 @@ runModule("Bighead", function(root)
             end
             local want
             if active and bh.neckFix then
-                want = entry.c0 * CFrame.new(0, (bh.scale - 1) * (o.size.Y / 2), 0)
+                -- lift by HALF the height delta so the head sits on the neck.
+                -- the old (scale-1) * fullHeight offset pushed it sky high and
+                -- contributed to the flinging.
+                want = entry.c0 * CFrame.new(0, (s - o.size.Y) / 2, 0)
             else
                 want = entry.c0
             end
@@ -542,18 +616,20 @@ runModule("Bighead", function(root)
             end
         end
 
-        for _, acc in ipairs(char:GetChildren()) do
-            if acc:IsA("Accessory") then
-                local handle = acc:FindFirstChild("Handle")
-                if handle then
-                    local att = handle:FindFirstChildWhichIsA("Attachment")
-                    if att and (att.Name == "HatAttachment" or string.find(att.Name, "Head") ~= nil) then
-                        local ho = bhRemember(handle)
-                        local wantSize = (active and bh.scaleHats) and ho.size * bh.scale or ho.size
-                        if handle.Size ~= wantSize then
-                            pcall(function()
-                                handle.Size = wantSize
-                            end)
+        if bh.scaleHats and active then
+            for _, acc in ipairs(char:GetChildren()) do
+                if acc:IsA("Accessory") then
+                    local handle = acc:FindFirstChild("Handle")
+                    if handle then
+                        local att = handle:FindFirstChildWhichIsA("Attachment")
+                        if att and (att.Name == "HatAttachment" or string.find(att.Name, "Head") ~= nil) then
+                            local ho = bhRemember(handle)
+                            local wantSize = ho.size * ratio
+                            if handle.Size ~= wantSize then
+                                pcall(function()
+                                    handle.Size = wantSize
+                                end)
+                            end
                         end
                     end
                 end
@@ -561,25 +637,21 @@ runModule("Bighead", function(root)
         end
     end
 
+    -- NOTE: never clears the tables, so repeated restores (hard disable)
+    -- keep re-asserting the remembered originals against server resets.
+    -- Weak keys clean up entries for destroyed parts automatically.
     local function bhRestoreAll()
         for part, o in pairs(bhOrig) do
-            pcall(function()
-                part.Size = o.size
-                part.Transparency = o.transparency
-                part.CanCollide = o.canCollide
-                part.CanTouch = o.canTouch
-                part.Massless = o.massless
-            end)
+            bhRestorePart(part, o)
         end
-        table.clear(bhOrig)
         for motor, entry in pairs(bhNeck) do
             pcall(function()
                 motor.C0 = entry.c0
             end)
         end
-        table.clear(bhNeck)
     end
 
+    -- per frame re-assertion; also heals whatever the game resets
     local renderConn = RunService.RenderStepped:Connect(function()
         if not bh.enabled then return end
         for _, plr in ipairs(Players:GetPlayers()) do
@@ -590,25 +662,50 @@ runModule("Bighead", function(root)
         end
     end)
 
-    local function refreshStatus()
+    -- hard disable: restore now, then again across the next second so nothing
+    -- (server property resets included) leaves a big head behind. This is the
+    -- fix for "bighead cannot be disabled".
+    local function bhHardRestore()
+        bh.enabled = false
+        bhRestoreAll()
+        task.defer(bhRestoreAll)
+        task.delay(0.1, bhRestoreAll)
+        task.delay(0.5, bhRestoreAll)
+        task.delay(1, bhRestoreAll)
+    end
+
+    -- APPLY: full restart of the effect with the current values
+    local function bhForceApply()
+        bhRestoreAll()
         if bh.enabled then
-            statusLabel.Text = "STATUS  active, x" .. bh.scale
-            statusLabel.TextColor3 = COLORS.Active
+            for _, plr in ipairs(Players:GetPlayers()) do
+                local char = plr.Character
+                if char then
+                    bhApplyChar(char, bh.includeMe or plr ~= LocalPlayer)
+                end
+            end
+            setStatus(string.format("applied: %.1f studs", bh.headStuds), COLORS.Active)
         else
-            statusLabel.Text = "STATUS  idle"
-            statusLabel.TextColor3 = COLORS.TextMuted
+            setStatus("values reset (bighead is off)", COLORS.TextMuted)
         end
     end
 
     local bhBtn
-    bhBtn = ui.button("ENABLE BIGHEAD", 32, function()
-        bh.enabled = not bh.enabled
-        if not bh.enabled then
-            bhRestoreAll()
+    local function refreshBtn()
+        if bhBtn then
+            bhBtn.Text = bh.enabled and "DISABLE BIGHEAD" or "ENABLE BIGHEAD"
+            bhBtn.TextColor3 = bh.enabled and COLORS.Active or COLORS.TextSecondary
         end
-        bhBtn.Text = bh.enabled and "DISABLE BIGHEAD" or "ENABLE BIGHEAD"
-        bhBtn.TextColor3 = bh.enabled and COLORS.Active or COLORS.TextSecondary
-        refreshStatus()
+    end
+    bhBtn = ui.button("ENABLE BIGHEAD", 32, function()
+        if bh.enabled then
+            bhHardRestore()
+            setStatus("idle", COLORS.TextMuted)
+        else
+            bh.enabled = true
+            setStatus(string.format("active, %.1f studs", bh.headStuds), COLORS.Active)
+        end
+        refreshBtn()
     end)
 
     ui.section("OPTIONS")
@@ -620,11 +717,38 @@ runModule("Bighead", function(root)
     ui.toggle("No Collide", bh, "noCollide")
     ui.toggle("No Touch", bh, "noTouch")
 
+    ui.section("HEAD SIZE (STUDS)")
+    local function onSizeChanged()
+        if bh.enabled then
+            setStatus(string.format("applied: %.1f studs", bh.headStuds), COLORS.Active)
+        end
+        for _, fn in ipairs(bh.__varRefresh) do
+            fn()
+        end
+    end
+    ui.varbox("Exact Size (0.5-10)", bh, "headStuds", 0.5, 10, onSizeChanged)
+    ui.slider("Head Size (studs)", bh, "headStuds", 1, 10, function(v)
+        return string.format("%.1f studs", v)
+    end, onSizeChanged)
+
+    ui.section("ACTIONS")
+    ui.button("APPLY (FORCE RESTART)", 32, function()
+        bhForceApply()
+        refreshBtn()
+    end)
+    ui.button("RESTORE ALL (TURN OFF)", 32, function()
+        bhHardRestore()
+        refreshBtn()
+        setStatus("idle", COLORS.TextMuted)
+    end)
+
     ui.section("VALUES")
-    ui.slider("Head Scale", bh, "scale", 1, 25)
     ui.slider("Ghost Transparency", bh, "ghostTransparency", 0, 100, function(v)
         return v .. "%"
     end)
+
+    ui.label("anti fling: massless + no collide + no touch, 2 studs default")
+    ui.label("APPLY reruns the effect; RESTORE clears every changed part")
 
     root.Destroying:Connect(function()
         renderConn:Disconnect()
