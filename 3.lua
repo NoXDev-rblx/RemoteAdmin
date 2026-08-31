@@ -1,12 +1,46 @@
 ----------------------------------------------------------------
--- remote admin 4.7 :: file 3/4 :: identifier + aimlock + overseer
+-- remote admin 5.2 :: file 3/5 :: identifier + aimlock + overseer
+-- install beside main.lua (file 1); runs only if its AllowedUserIds gate passes
 ----------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
 local ReplicatedStorage = game:GetService("ReplicatedStorage")
 local LocalPlayer = Players.LocalPlayer
-local uiParent = LocalPlayer and (LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10))
+do
+    local t0 = os.clock()
+    while not LocalPlayer and os.clock() - t0 < 10 do
+        task.wait(0.1)
+        LocalPlayer = Players.LocalPlayer
+    end
+end
+assert(LocalPlayer, "[RemoteAdmin] file 3: no LocalPlayer, client only")
+local uiParent = LocalPlayer:FindFirstChild("PlayerGui") or LocalPlayer:WaitForChild("PlayerGui", 10)
+assert(uiParent, "[RemoteAdmin] file 3: PlayerGui never appeared")
+
+----------------------------------------------------------------
+-- GATE: main.lua (file 1) creates the shared RA_BUS only after its
+-- AllowedUserIds check passes. No bus here = this client is not an
+-- admin: stand down so none of this file's modules ever run.
+----------------------------------------------------------------
+local function gateClosed()
+    if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+        return true
+    end
+    local t0 = os.clock()
+    while not ReplicatedStorage:FindFirstChild("RA_BUS") and os.clock() - t0 < 30 do
+        if LocalPlayer:GetAttribute("RA_GateDenied") == true then
+            return true
+        end
+        task.wait(0.25)
+    end
+    return not ReplicatedStorage:FindFirstChild("RA_BUS")
+end
+
+if gateClosed() then
+    print("[RemoteAdmin] file 3: admin gate closed (not on AllowedUserIds) - standing down")
+    return
+end
 
 local COLORS = {
     Background    = Color3.fromRGB(13, 13, 13),
@@ -348,7 +382,7 @@ local function newTab(page, pageName, root)
         end)
     end
 
-    function ui.slider(labelText, state, key, minV, maxV, display)
+    function ui.slider(labelText, state, key, minV, maxV, display, onSet)
         local row = ui.row(30)
         make("TextLabel", {
             BackgroundTransparency = 1, Size = UDim2.new(1, -64, 0, 14),
@@ -377,6 +411,7 @@ local function newTab(page, pageName, root)
             state[key] = math.clamp(v, minV, maxV)
             val.Text = text(state[key])
             fill.Size = UDim2.new((state[key] - minV) / (maxV - minV), 0, 1, 0)
+            if onSet then onSet(state[key]) end
         end
         local function setFromX(x)
             local rel = math.clamp((x - track.AbsolutePosition.X) / math.max(track.AbsoluteSize.X, 1), 0, 1)
@@ -677,7 +712,9 @@ runModule("Identifier", function(root)
                             for ys = -1, 1, 2 do
                                 for zs = -1, 1, 2 do
                                     local world = (cf * CFrame.new(hx * xs, hy * ys, hz * zs)).Position
-                                    local pt = cam:WorldToScreenPoint(world)
+                                    -- viewport space: this gui ignores the GUI inset,
+                                    -- so viewport coords line up with GetMouseLocation
+                                    local pt = cam:WorldToViewportPoint(world)
                                     if pt.Z > 0 then
                                         any = true
                                         if pt.X < minX then minX = pt.X end
@@ -793,7 +830,28 @@ runModule("Identifier", function(root)
 end)
 
 -- ================================================================
--- AIMLOCK
+-- AIMLOCK (v5.2 -- rewritten from scratch)
+--
+-- Why the old one never moved the camera in many games: it wrote
+-- cam.CFrame at RenderPriority.Camera + 1 (priority 201). Any game
+-- camera controller bound after that priority (custom cams commonly
+-- bind at 300+, some later) recomputed the camera afterwards and
+-- wiped the lock every frame. This version writes the camera at
+-- RenderPriority.Last (2000) -- the final word each frame -- and
+-- only while a lock is actually active. It never changes
+-- CameraType and never forces MouseBehavior, so nothing fights
+-- back and nothing needs restoring.
+--
+-- Engine:
+--   * HOLD / TOGGLE / AUTO activation with a rebindable key
+--   * pick mode: CROSSHAIR (in FOV ring), NEAREST (3D distance),
+--     LOWEST HP (finisher pick)
+--   * sticky lock, team check, visible-only raycast (walls only,
+--     other characters never block the ray)
+--   * prediction: velocity lead + optional gravity drop comp
+--   * smoothness slider or instant snap
+--   * manual override: hold LEFT ALT to aim freely, menu open and
+--     spectator FP pause the lock automatically
 -- ================================================================
 runModule("Aimlock", function(root)
     local hud, mainFrame, list, pages = resolveUI(root)
@@ -806,12 +864,22 @@ runModule("Aimlock", function(root)
     local aimStatusLabel = ui.status()
 
     local aim = {
-        enabled = false, mode = "HOLD", key = { inputType = Enum.UserInputType.MouseButton2 },
-        latched = false, fov = 150, showFov = true, outline = true, accuracy = 85,
-        part = "HEAD", teamCheck = false, visibleOnly = false, sticky = true,
-        maxDist = 1000, prediction = false, predStrength = 15, marker = true,
+        enabled = false,
+        mode = "HOLD",            -- HOLD / TOGGLE / AUTO
+        pick = "CROSSHAIR",       -- CROSSHAIR / NEAREST / LOWEST HP
+        key = { inputType = Enum.UserInputType.MouseButton2 },
+        latched = false,
+        fov = 150, showFov = true, outline = true,
+        smooth = 14, snap = false,
+        part = "HEAD",            -- HEAD / TORSO / HRP
+        teamCheck = false, visibleOnly = true, sticky = true,
+        maxDist = 2000,
+        prediction = true, leadPct = 15,
+        gravityComp = false, muzzleSpeed = 250,
+        marker = true, targetTag = true,
     }
 
+    -- overlay (viewport space, IgnoreGuiInset matches projection math)
     local aimGui = Instance.new("ScreenGui")
     aimGui.Name = "RA_Aimlock"
     aimGui.ResetOnSpawn = false
@@ -819,19 +887,20 @@ runModule("Aimlock", function(root)
     aimGui.DisplayOrder = 39
     aimGui.Parent = uiParent
 
-    local aimBG = make("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        BorderSizePixel = 0, Visible = false }, aimGui)
-    make("UICorner", { CornerRadius = UDim.new(1, 0) }, aimBG)
-    local aimBGStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1.5, Transparency = 1 }, aimBG)
-
     local aimRing = make("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
         BorderSizePixel = 0, Visible = false }, aimGui)
     make("UICorner", { CornerRadius = UDim.new(1, 0) }, aimRing)
     local aimRingStroke = make("UIStroke", { Color = COLORS.Active, Thickness = 1.5, Transparency = 0.35 }, aimRing)
 
     local aimMarker = make("Frame", { AnchorPoint = Vector2.new(0.5, 0.5), BackgroundTransparency = 1,
-        BorderSizePixel = 0, Size = UDim2.fromOffset(12, 12), Visible = false }, aimGui)
-    local aimMarkerStroke = make("UIStroke", { Color = COLORS.Active, Thickness = 1 }, aimMarker)
+        BorderSizePixel = 0, Size = UDim2.fromOffset(12, 12), Visible = false, Rotation = 45 }, aimGui)
+    local aimMarkerStroke = make("UIStroke", { Color = Color3.fromRGB(255, 77, 77), Thickness = 1.5 }, aimMarker)
+
+    local aimTag = make("TextLabel", {
+        AnchorPoint = Vector2.new(0.5, 0), BackgroundColor3 = Color3.fromRGB(0, 0, 0),
+        BackgroundTransparency = 0.45, BorderSizePixel = 0, Size = UDim2.fromOffset(130, 18),
+        Visible = false, Font = FONT_B, TextSize = 12, TextColor3 = Color3.fromRGB(255, 96, 96),
+    }, aimGui)
 
     local aimRay = RaycastParams.new()
     aimRay.FilterType = Enum.RaycastFilterType.Exclude
@@ -874,47 +943,91 @@ runModule("Aimlock", function(root)
         return input.KeyCode == aim.key.keyCode
     end
 
-    local function aimTargetPart(char)
-        local ro = char:FindFirstChild("HumanoidRootPart")
-        if aim.part == "TORSO" then
-            return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso") or ro
+    local function aimHitPart(char)
+        if aim.part == "HRP" then
+            return char:FindFirstChild("HumanoidRootPart")
         end
-        return char:FindFirstChild("Head") or ro
+        if aim.part == "TORSO" then
+            return char:FindFirstChild("UpperTorso") or char:FindFirstChild("Torso")
+        end
+        return char:FindFirstChild("Head") or char:FindFirstChild("HumanoidRootPart")
     end
 
-    local function aimVisible(cam, char, pos)
-        local filter = {}
+    -- line of sight: walls block, other characters do not
+    local function aimVisible(cam, targetChar, pos)
+        local filter = { cam }
         if LocalPlayer.Character then
             table.insert(filter, LocalPlayer.Character)
         end
-        table.insert(filter, char)
-        table.insert(filter, cam)
+        for _, plr in ipairs(Players:GetPlayers()) do
+            if plr.Character and plr.Character ~= targetChar then
+                table.insert(filter, plr.Character)
+            end
+        end
         aimRay.FilterDescendantsInstances = filter
-        return workspace:Raycast(cam.CFrame.Position, pos - cam.CFrame.Position, aimRay) == nil
+        local dir = pos - cam.CFrame.Position
+        if dir.Magnitude < 0.05 then return true end
+        return workspace:Raycast(cam.CFrame.Position, dir, aimRay) == nil
+    end
+
+    -- aim origin in VIEWPORT pixels: screen center while the game locks
+    -- the cursor (or FP), free cursor otherwise
+    local function aimOriginPx(cam)
+        if root:GetAttribute("FP") == true
+            or UserInputService.MouseBehavior == Enum.MouseBehavior.LockCenter then
+            return Vector2.new(cam.ViewportSize.X * 0.5, cam.ViewportSize.Y * 0.5)
+        end
+        local m = UserInputService:GetMouseLocation()
+        return Vector2.new(m.X, m.Y)
+    end
+
+    local function aimAlive(plr)
+        local char = plr.Character
+        if not char then return nil end
+        local hum = char:FindFirstChildOfClass("Humanoid")
+        if not (hum and hum.Health > 0) then return nil end
+        local part = aimHitPart(char)
+        if not part then return nil end
+        return char, hum, part
     end
 
     local function aimPickTarget(cam)
-        local mouse = UserInputService:GetMouseLocation()
-        local best, bestD = nil, aim.fov
+        local camPos = cam.CFrame.Position
+        local mouse = aimOriginPx(cam)
+        local best, bestScore = nil, math.huge
         for _, plr in ipairs(Players:GetPlayers()) do
             if plr ~= LocalPlayer then
-                local char = plr.Character
-                local hum = char and char:FindFirstChildOfClass("Humanoid")
-                if char and hum and hum.Health > 0 then
-                    local teamOk = not (aim.teamCheck and plr.Team and plr.Team == LocalPlayer.Team)
-                    if teamOk then
-                        local part = aimTargetPart(char)
-                        if part then
-                            local pos = part.Position
-                            if (pos - cam.CFrame.Position).Magnitude <= aim.maxDist then
+                local teamOk = not (aim.teamCheck and plr.Team and plr.Team == LocalPlayer.Team)
+                if teamOk then
+                    local char, hum, part = aimAlive(plr)
+                    if char then
+                        local pos = part.Position
+                        local dist3 = (pos - camPos).Magnitude
+                        if dist3 <= aim.maxDist then
+                            local onScreen = true
+                            local px = 0
+                            if aim.pick == "CROSSHAIR" then
+                                local pt = cam:WorldToViewportPoint(pos)
+                                if pt.Z <= 0 then
+                                    onScreen = false
+                                else
+                                    px = math.sqrt((pt.X - mouse.X) ^ 2 + (pt.Y - mouse.Y) ^ 2)
+                                    if px > aim.fov then onScreen = false end
+                                end
+                            end
+                            if onScreen then
                                 local ok = not aim.visibleOnly or aimVisible(cam, char, pos)
                                 if ok then
-                                    local pt = cam:WorldToScreenPoint(pos)
-                                    if pt.Z > 0 then
-                                        local d = math.sqrt((pt.X - mouse.X) ^ 2 + (pt.Y - mouse.Y) ^ 2)
-                                        if d <= aim.fov and d < bestD then
-                                            best, bestD = plr, d
-                                        end
+                                    local score
+                                    if aim.pick == "NEAREST" then
+                                        score = dist3
+                                    elseif aim.pick == "LOWEST HP" then
+                                        score = hum.Health
+                                    else
+                                        score = px
+                                    end
+                                    if score < bestScore then
+                                        best, bestScore = plr, score
                                     end
                                 end
                             end
@@ -928,25 +1041,31 @@ runModule("Aimlock", function(root)
 
     local function aimTargetValid(plr, cam)
         if not plr then return false end
-        local char = plr.Character
-        local hum = char and char:FindFirstChildOfClass("Humanoid")
-        local part = char and aimTargetPart(char)
-        if not (hum and part and hum.Health > 0) then return false end
-        local pt = cam:WorldToScreenPoint(part.Position)
+        local char, hum, part = aimAlive(plr)
+        if not char then return false end
+        local pos = part.Position
+        if (pos - cam.CFrame.Position).Magnitude > aim.maxDist * 1.2 then return false end
+        local pt = cam:WorldToViewportPoint(pos)
         if pt.Z <= 0 then return false end
-        local mouse = UserInputService:GetMouseLocation()
-        local d = math.sqrt((pt.X - mouse.X) ^ 2 + (pt.Y - mouse.Y) ^ 2)
-        return d <= aim.fov * 2
+        local mouse = aimOriginPx(cam)
+        local px = math.sqrt((pt.X - mouse.X) ^ 2 + (pt.Y - mouse.Y) ^ 2)
+        -- sticky window is generous so jittery targets are not dropped
+        return px <= aim.fov * 2.5
     end
 
-    RunService:BindToRenderStep("RA_aimlockStep", Enum.RenderPriority.Camera.Value + 1, function(dt)
+    RunService:BindToRenderStep("RA_aimlockStep", Enum.RenderPriority.Last.Value, function(dt)
         dt = math.min(dt, 0.05)
         local cam = workspace.CurrentCamera
         if not cam then return end
-        local mouse = UserInputService:GetMouseLocation()
+        local mouse = aimOriginPx(cam)
+
+        local menuOpen = root:GetAttribute("Open") == true
+        local camBusy = root:GetAttribute("FP") == true
+            or UserInputService:IsKeyDown(Enum.KeyCode.LeftAlt)
+            or UserInputService:GetFocusedTextBox() ~= nil
 
         local active = false
-        if aim.enabled and root:GetAttribute("Open") ~= true then
+        if aim.enabled and not menuOpen and not camBusy then
             if aim.mode == "AUTO" then
                 active = true
             elseif aim.mode == "HOLD" then
@@ -964,70 +1083,86 @@ runModule("Aimlock", function(root)
             currentTarget = nil
         end
 
-        -- claim the cursor only while aimlock is actually in use,
-        -- so the game's own mouse/camera handling is untouched otherwise
-        if active and root:GetAttribute("FP") ~= true then
-            UserInputService.MouseIconEnabled = true
-            UserInputService.MouseBehavior = Enum.MouseBehavior.Default
-        end
-
-        local show = aim.enabled and aim.showFov and root:GetAttribute("Open") ~= true
+        local show = aim.enabled and aim.showFov and not menuOpen
         aimRing.Visible = show
-        aimBG.Visible = show and aim.outline
         if show then
             aimRing.Position = UDim2.fromOffset(mouse.X, mouse.Y)
             aimRing.Size = UDim2.fromOffset(aim.fov * 2, aim.fov * 2)
-            aimBG.Position = aimRing.Position
-            aimBG.Size = UDim2.fromOffset(aim.fov * 2 + 4, aim.fov * 2 + 4)
             aimRingStroke.Transparency = currentTarget and 0 or 0.35
             aimRingStroke.Color = currentTarget and Color3.fromRGB(255, 77, 77) or COLORS.Active
-            aimBGStroke.Transparency = aim.outline and 0.2 or 1
         end
 
-        if currentTarget then
+        if active and currentTarget then
             local char = currentTarget.Character
-            local part = char and aimTargetPart(char)
+            local part = char and aimHitPart(char)
             if part then
                 local aimPos = part.Position
                 if aim.prediction then
-                    aimPos += part.AssemblyLinearVelocity * (aim.predStrength / 100)
+                    local hrp = char:FindFirstChild("HumanoidRootPart")
+                    local vel = (hrp and hrp.AssemblyLinearVelocity) or part.AssemblyLinearVelocity
+                    aimPos += vel * (aim.leadPct / 100)
                 end
-                local camPos = cam.CFrame.Position
-                local desired = (aimPos - camPos).Unit
-                local cur = cam.CFrame.LookVector
-                local alpha = (aim.accuracy >= 100) and 1 or math.clamp(dt * (aim.accuracy / 100) * 20, 0, 1)
-                local newLook = cur:Lerp(desired, alpha)
-                if newLook.Magnitude > 0.001 then
-                    cam.CFrame = CFrame.lookAt(camPos, camPos + newLook.Unit)
+                if aim.gravityComp then
+                    local dist = (aimPos - cam.CFrame.Position).Magnitude
+                    local t = dist / math.max(aim.muzzleSpeed, 1)
+                    aimPos -= Vector3.new(0, 0.5 * workspace.Gravity * t * t, 0)
                 end
 
-                aimMarker.Visible = aim.marker
-                if aim.marker then
-                    local pt = cam:WorldToScreenPoint(part.Position)
-                    if pt.Z > 0 then
-                        aimMarker.Position = UDim2.fromOffset(pt.X, pt.Y)
-                        aimMarkerStroke.Color = Color3.fromRGB(255, 77, 77)
+                -- THE FIX: this runs at RenderPriority.Last, after every
+                -- camera script, so nothing can overwrite the lock
+                local camPos = cam.CFrame.Position
+                local desired = aimPos - camPos
+                if desired.Magnitude > 0.01 then
+                    desired = desired.Unit
+                    if aim.snap then
+                        cam.CFrame = CFrame.lookAt(camPos, camPos + desired)
                     else
-                        aimMarker.Visible = false
+                        local alpha = math.clamp(dt * aim.smooth * 0.5, 0, 1)
+                        local newLook = cam.CFrame.LookVector:Lerp(desired, alpha)
+                        if newLook.Magnitude > 0.001 then
+                            cam.CFrame = CFrame.lookAt(camPos, camPos + newLook.Unit)
+                        end
                     end
+                end
+
+                local pt = cam:WorldToViewportPoint(part.Position)
+                aimMarker.Visible = aim.marker and pt.Z > 0
+                if aimMarker.Visible then
+                    aimMarker.Position = UDim2.fromOffset(pt.X, pt.Y)
+                end
+                aimTag.Visible = aim.targetTag and pt.Z > 0
+                if aimTag.Visible then
+                    aimTag.Position = UDim2.fromOffset(pt.X - 65, pt.Y + 12)
+                    aimTag.Text = currentTarget.DisplayName .. "  "
+                        .. tostring(math.floor((part.Position - camPos).Magnitude + 0.5)) .. "m"
                 end
                 aimSetStatus(aim.mode .. " [" .. aimKeyLabel() .. "] LOCK " .. string.upper(currentTarget.DisplayName))
             else
                 aimMarker.Visible = false
+                aimTag.Visible = false
+                currentTarget = nil
                 aimSetStatus(aim.mode .. " [" .. aimKeyLabel() .. "] searching")
             end
         else
             aimMarker.Visible = false
+            aimTag.Visible = false
             if aim.enabled then
-                aimSetStatus(aim.mode .. " [" .. aimKeyLabel() .. "] searching")
+                if camBusy then
+                    aimSetStatus("paused (camera in use)")
+                elseif aim.mode == "HOLD" and not aim.key then
+                    aimSetStatus("bind a key below")
+                elseif aim.mode == "TOGGLE" and not aim.latched then
+                    aimSetStatus("TOGGLE [" .. aimKeyLabel() .. "] press key to lock")
+                else
+                    aimSetStatus(aim.mode .. " [" .. aimKeyLabel() .. "] searching")
+                end
             else
-                aimSetStatus("idle")
+                aimSetStatus("idle - enable below, hold key to lock")
             end
         end
     end)
 
     local inputConn = UserInputService.InputBegan:Connect(function(input, processed)
-        if processed then return end
         if capturing then
             if input.UserInputType == Enum.UserInputType.MouseButton1 or input.UserInputType == Enum.UserInputType.MouseButton2 then
                 aim.key = { inputType = input.UserInputType }
@@ -1061,7 +1196,7 @@ runModule("Aimlock", function(root)
         Text = "MODE HOLD", TextSize = 13, TextColor3 = COLORS.TextSecondary,
     }, modeRow)
     strokeOn(aimModeBtn)
-    aimModeBtn.MouseButton1Click:Connect(function()
+    local function cycleMode()
         if aim.mode == "HOLD" then
             aim.mode = "TOGGLE"
         elseif aim.mode == "TOGGLE" then
@@ -1071,18 +1206,10 @@ runModule("Aimlock", function(root)
         end
         aim.latched = false
         aimModeBtn.Text = "MODE " .. aim.mode
-    end)
-    ui.registerRow(modeRow, "row", function()
-        if aim.mode == "HOLD" then
-            aim.mode = "TOGGLE"
-        elseif aim.mode == "TOGGLE" then
-            aim.mode = "AUTO"
-        else
-            aim.mode = "HOLD"
-        end
-        aim.latched = false
-        aimModeBtn.Text = "MODE " .. aim.mode
-    end, "Cycle_Activation")
+    end
+    aimModeBtn.MouseButton1Click:Connect(cycleMode)
+    ui.registerRow(modeRow, "row", cycleMode, "Cycle_Mode")
+    aimModeBtn.Text = "MODE " .. aim.mode
 
     aimKeyBtn = make("TextButton", {
         Size = UDim2.new(0.5, -3, 1, 0), Position = UDim2.new(0.5, 3, 0, 0),
@@ -1102,32 +1229,59 @@ runModule("Aimlock", function(root)
         aimKeyBtn.Text = "KEY NONE"
     end)
 
-    ui.section("TARGETING")
+    ui.section("TARGET PICKING")
+    local pickBtn
+    pickBtn = ui.button("PICK " .. aim.pick, 24, function()
+        if aim.pick == "CROSSHAIR" then
+            aim.pick = "NEAREST"
+        elseif aim.pick == "NEAREST" then
+            aim.pick = "LOWEST HP"
+        else
+            aim.pick = "CROSSHAIR"
+        end
+        pickBtn.Text = "PICK " .. aim.pick
+    end)
     ui.toggle("Team Check", aim, "teamCheck")
     ui.toggle("Visible Only", aim, "visibleOnly")
     ui.toggle("Sticky Aim", aim, "sticky")
-    ui.toggle("Prediction", aim, "prediction")
-    ui.slider("Prediction Lead", aim, "predStrength", 0, 50, function(v)
+    ui.slider("Max Distance", aim, "maxDist", 100, 5000)
+    ui.slider("FOV Radius", aim, "fov", 30, 800)
+
+    ui.section("PREDICTION")
+    ui.toggle("Velocity Lead", aim, "prediction")
+    ui.slider("Lead %", aim, "leadPct", 0, 50, function(v)
         return string.format("%.2fs", v / 100)
     end)
-    ui.slider("Max Distance", aim, "maxDist", 100, 5000)
-
-    ui.section("AIMING")
-    ui.slider("FOV Radius", aim, "fov", 30, 800)
-    ui.toggle("Show FOV Circle", aim, "showFov")
-    ui.toggle("Circle Outline", aim, "outline")
-    ui.slider("Accuracy", aim, "accuracy", 0, 100, function(v)
-        return v .. "%"
+    ui.toggle("Gravity Drop Comp", aim, "gravityComp")
+    ui.slider("Muzzle Speed", aim, "muzzleSpeed", 50, 1000, function(v)
+        return v .. " st/s"
     end)
 
+    ui.section("AIMING")
+    ui.slider("Smoothness", aim, "smooth", 1, 40)
+    ui.toggle("Instant Snap", aim, "snap")
     local partBtn
-    partBtn = ui.button("HITBOX HEAD", 24, function()
-        aim.part = (aim.part == "HEAD") and "TORSO" or "HEAD"
+    partBtn = ui.button("HITBOX " .. aim.part, 24, function()
+        if aim.part == "HEAD" then
+            aim.part = "TORSO"
+        elseif aim.part == "TORSO" then
+            aim.part = "HRP"
+        else
+            aim.part = "HEAD"
+        end
         partBtn.Text = "HITBOX " .. aim.part
     end)
 
     ui.section("HUD")
+    ui.toggle("Show FOV Circle", aim, "showFov")
+    ui.toggle("Circle Outline", aim, "outline")
     ui.toggle("Lock Marker", aim, "marker")
+    ui.toggle("Target Tag", aim, "targetTag")
+
+    ui.section("ACTIONS")
+    ui.action("FORCE RE-PICK", function()
+        currentTarget = nil
+    end)
 
     root.Destroying:Connect(function()
         inputConn:Disconnect()
@@ -1156,7 +1310,8 @@ runModule("Overseer", function(root)
         showPanels = true,
         showPrediction = true,
         onlyFlagged = false,
-        predTicks = 4,
+        ballistic = true,
+        predTicks = 6,
         speedFlag = 60,
         teleportDist = 35,
         flyTime = 2,
@@ -1236,8 +1391,8 @@ runModule("Overseer", function(root)
 
     local function makeDots()
         local dots, strokes = {}, {}
-        for k = 1, 4 do
-            local big = (k == 4)
+        for k = 1, 6 do
+            local big = (k == 6)
             local dot = make("Frame", {
                 AnchorPoint = Vector2.new(0.5, 0.5),
                 Size = UDim2.fromOffset(big and 10 or 6, big and 10 or 6),
@@ -1258,6 +1413,7 @@ runModule("Overseer", function(root)
             cd = {}, recent = {}, score = 0, hits = 0,
             char = nil, hasLast = false, lastPos = Vector3.zero,
             spdT = 0, flyT = 0, hspeed = 0, vel = nil, pos = nil,
+            svel = nil, acc = nil, lastVel = nil,
             lastDetect = 0, lastPanel = 0, lastFlagAt = 0,
         }
     end
@@ -1290,6 +1446,9 @@ runModule("Overseer", function(root)
             d.score = 0
             d.recent = {}
             d.cd = {}
+            d.svel = nil
+            d.acc = nil
+            d.lastVel = nil
             hideAll(d)
         end
     end
@@ -1331,6 +1490,9 @@ runModule("Overseer", function(root)
                 d.hasLast = false
                 d.spdT = 0
                 d.flyT = 0
+                d.svel = nil
+                d.acc = nil
+                d.lastVel = nil
             end
             local hum = char and char:FindFirstChildOfClass("Humanoid")
             local ro = char and char:FindFirstChild("HumanoidRootPart")
@@ -1344,6 +1506,24 @@ runModule("Overseer", function(root)
                 if now - d.lastDetect >= 0.06 then
                     local ddt = math.clamp(now - d.lastDetect, 0.01, 0.25)
                     d.lastDetect = now
+
+                    -- prediction trackers: EMA smoothed velocity + acceleration
+                    -- estimate, so the drawn arc leads turns and jumps instead of
+                    -- lagging a frame behind raw velocity
+                    if d.lastVel then
+                        local inst = (vel - d.lastVel) / ddt
+                        if d.acc then
+                            d.acc += (inst - d.acc) * math.clamp(ddt * 3, 0, 1)
+                        else
+                            d.acc = inst
+                        end
+                    end
+                    d.lastVel = vel
+                    if d.svel then
+                        d.svel += (vel - d.svel) * math.clamp(ddt * 6, 0, 1)
+                    else
+                        d.svel = vel
+                    end
 
                     if d.hasLast then
                         local disp = (pos - d.lastPos).Magnitude
@@ -1388,21 +1568,32 @@ runModule("Overseer", function(root)
                 d.hasLast = false
             end
 
-            local showDots = ovs.showPrediction and alive and d.pos and d.vel and d.vel.Magnitude > 6
-            local lead = ovs.predTicks / 4
-            for k = 1, 4 do
+            local showDots = ovs.showPrediction and alive and d.pos and d.svel and d.svel.Magnitude > 4
+            -- lead horizon: predTicks sixths of a second, dots sample the arc
+            local lead = ovs.predTicks / 6
+            -- gravity only bends the arc when the target is actually airborne
+            local airborne = hum and hum.FloorMaterial == Enum.Material.Air
+            for k = 1, 6 do
                 local dot = d.dots[k]
                 if not showDots then
                     dot.Visible = false
                 else
-                    local wp = d.pos + d.vel * (lead * k / 4)
+                    local t = lead * k / 6
+                    local wp = d.pos + d.svel * t
+                    if d.acc then
+                        wp += d.acc * (0.5 * t * t)
+                    end
+                    if ovs.ballistic and airborne and t > 0 then
+                        wp += Vector3.new(0, -0.5 * workspace.Gravity * t * t, 0)
+                    end
                     local ok, pt = pcall(function()
-                        return cam:WorldToScreenPoint(wp)
+                        return cam:WorldToViewportPoint(wp)
                     end)
                     if ok and pt.Z > 0 then
                         dot.Visible = true
                         dot.Position = UDim2.fromOffset(pt.X, pt.Y)
                         d.dotStrokes[k].Color = scoreColor(d.score)
+                        d.dotStrokes[k].Transparency = 0.15 + 0.6 * (k - 1) / 5
                     else
                         dot.Visible = false
                     end
@@ -1457,13 +1648,15 @@ runModule("Overseer", function(root)
 
     ui.section("PREDICTION")
     ui.toggle("Show Prediction", ovs, "showPrediction")
-    ui.slider("Prediction Lead", ovs, "predTicks", 1, 12, function(v)
-        return string.format("%.2fs", v / 4)
+    ui.toggle("Ballistic Arcs", ovs, "ballistic")
+    ui.slider("Prediction Lead", ovs, "predTicks", 2, 18, function(v)
+        return string.format("%.2fs", v / 6)
     end)
 
     ui.section("LEGEND")
     ui.label("TP  position jump   SPD  overspeed")
     ui.label("FLY  sustained vertical thrust")
+    ui.label("dots lead movement, arcs bend with gravity when airborne")
     ui.label("score decays while a player behaves")
 
     root.Destroying:Connect(function()
