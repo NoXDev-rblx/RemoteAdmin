@@ -1,7 +1,6 @@
-----------------------------------------------------------------
--- remote admin 5.2 :: file 3/5 :: identifier + aimlock + overseer
--- install beside main.lua (file 1); runs only if its AllowedUserIds gate passes
-----------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+-- RA [REMOTE HVH], TO BE USED ONLY IN MODULE SCRIPTS. THIS IS ONLY TO BE HARDLOADED INTO A ROBLOX GAME TO SIMULATE 'CHEATS' BY THE CREATORS OF A GAME AND BE UNINJECTABLE. ENSURE OBFUSCATING THE FILE SO LOADING IT BY A EXECUTOR IS IMPOSSIBLE.
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
 local UserInputService = game:GetService("UserInputService")
@@ -22,19 +21,33 @@ assert(uiParent, "[RemoteAdmin] file 3: PlayerGui never appeared")
 -- GATE: main.lua (file 1) creates the shared RA_BUS only after its
 -- AllowedUserIds check passes. No bus here = this client is not an
 -- admin: stand down so none of this file's modules ever run.
+--
+-- FIX (hardening): anything in ReplicatedStorage can be forged locally
+-- by an exploiter (they can create a Folder named RA_BUS with Ready =
+-- true and the right attributes, then rebuild a matching HUD tree), so
+-- a ReplicatedStorage gate can never be trusted for admin-only tools.
+-- The strongest compatible setup: the SERVER parents a per-admin copy
+-- of RA_BUS under that admin's PlayerGui -- instances a server parents
+-- under one player's PlayerGui replicate to that player only. Both
+-- locations are accepted here so file 1 can adopt that at its own pace.
 ----------------------------------------------------------------
+local function findBus()
+    return ReplicatedStorage:FindFirstChild("RA_BUS")
+        or (uiParent and uiParent:FindFirstChild("RA_BUS")) or nil
+end
+
 local function gateClosed()
     if LocalPlayer:GetAttribute("RA_GateDenied") == true then
         return true
     end
     local t0 = os.clock()
-    while not ReplicatedStorage:FindFirstChild("RA_BUS") and os.clock() - t0 < 30 do
+    while not findBus() and os.clock() - t0 < 30 do
         if LocalPlayer:GetAttribute("RA_GateDenied") == true then
             return true
         end
         task.wait(0.25)
     end
-    return not ReplicatedStorage:FindFirstChild("RA_BUS")
+    return not findBus()
 end
 
 if gateClosed() then
@@ -467,16 +480,45 @@ local function runModule(name, fn)
                 end
             end)
         end
-        local existing = ReplicatedStorage:FindFirstChild("RA_BUS")
+        local existing = findBus()
         if existing then hookBus(existing) end
         ReplicatedStorage.ChildAdded:Connect(function(child)
             if child.Name == "RA_BUS" then hookBus(child) end
         end)
+        -- FIX: also watch PlayerGui for a server-planted per-admin bus.
+        if uiParent then
+            uiParent.ChildAdded:Connect(function(child)
+                if child.Name == "RA_BUS" then hookBus(child) end
+            end)
+        end
     end)
 end
 
 -- ================================================================
--- IDENTIFIER
+-- IDENTIFIER (v2 -- 3-mode selection)
+--
+-- I-1 :: CLASSIC BOX GRID   the original projected-box identifier,
+--                           behaviour unchanged, still 1st in the
+--                           selection.
+-- I-2 :: BASIC HIGHLIGHT    one engine Highlight per character,
+--                           tinted with the same per-player color.
+--                           Deliberately dumb: no overlays, it only
+--                           obeys the shared visibility options. The
+--                           engine renders at most ~31 Highlights at
+--                           once, so that is the practical cap.
+-- I-3 :: OMNI-VECTOR ARRAY  the overcomplicated one. Corner brackets
+--                           graded by a fake threat score, rotating
+--                           lock dial, scan sweep, telemetry line,
+--                           bottom-center tracers, screen-edge
+--                           intercept chevrons and a pulsing lock
+--                           ring on the nearest target. None of it
+--                           adds accuracy. That is the point.
+--
+-- F-6 is decommissioned at operator request; its slot stays empty.
+--
+-- All three modes share one render step. Only the selected mode
+-- renders; switching modes parks (clears) the previous one so no
+-- boxes, highlights or vector lines linger on screen.
 -- ================================================================
 runModule("Identifier", function(root)
     local hud, mainFrame, list, pages = resolveUI(root)
@@ -490,6 +532,7 @@ runModule("Identifier", function(root)
 
     local ident = {
         enabled = false,
+        mode = 1,
         showWhenVisible = true,
         outline = true,
         ignoreTeam = false,
@@ -501,6 +544,12 @@ runModule("Identifier", function(root)
         showUsername = false,
         showUserId = false,
         maxDistance = 500,
+        ovaTracers = true,
+        ovaArrows = true,
+        ovaTelemetry = true,
+        ovaThreat = true,
+        ovaSweep = true,
+        ovaScan = 5,
     }
 
     local ID_COLORS = {
@@ -521,10 +570,13 @@ runModule("Identifier", function(root)
     identGui.DisplayOrder = 40
     identGui.Parent = uiParent
 
-    local identObjects = {}
     local identRay = RaycastParams.new()
     identRay.FilterType = Enum.RaycastFilterType.Exclude
-    identRay.RespectCanCollide = true
+    -- RespectCanCollide = false (kept from v1). This ray is only used
+    -- for the "show when occluded" mode; with true, non-collidable map
+    -- decor (invisible zone walls, foliage, thin glass) never counted
+    -- as cover and occluded players were wrongly hidden.
+    identRay.RespectCanCollide = false
 
     local PRIORITY = {
         Head = true, HumanoidRootPart = true, Torso = true,
@@ -550,7 +602,9 @@ runModule("Identifier", function(root)
         end
         if #parts < 20 then
             for _, d in ipairs(char:GetDescendants()) do
-                if d:IsA("BasePart") and not PRIORITY[d.Name] and d.Transparency < 0.95 then
+                -- skip accessory handles so hats/hair don't inflate the box
+                local parentIsAccessory = d.Parent and d.Parent:IsA("Accoutrement")
+                if d:IsA("BasePart") and not PRIORITY[d.Name] and not parentIsAccessory and d.Transparency < 0.95 then
                     local s = d.Size
                     if s.X <= 6 and s.Y <= 6 and s.Z <= 6
                         and (d.Position - origin).Magnitude <= 6 then
@@ -563,7 +617,7 @@ runModule("Identifier", function(root)
         return (#parts > 0) and parts or nil
     end
 
-    local function identOccluded(char)
+    local function occluded(char)
         local cam = workspace.CurrentCamera
         local ro = char:FindFirstChild("HumanoidRootPart")
         if not (cam and ro) then
@@ -579,159 +633,156 @@ runModule("Identifier", function(root)
         return workspace:Raycast(cam.CFrame.Position, ro.Position - cam.CFrame.Position, identRay) ~= nil
     end
 
-    local function identMakeObj(plr)
-        local color = idColorFor(plr)
-
-        local frame = Instance.new("Frame")
-        frame.Visible = false
-        frame.BackgroundTransparency = 1
-        frame.BorderSizePixel = 0
-        frame.Parent = identGui
-
-        local out = make("Frame", {
-            BackgroundTransparency = 1, BorderSizePixel = 0,
-            Position = UDim2.new(0, -1, 0, -1), Size = UDim2.new(1, 2, 1, 2), ZIndex = 1,
-        }, frame)
-        local outStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
-            ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Transparency = ident.outline and 0 or 1 }, out)
-
-        local box = make("Frame", {
-            BackgroundTransparency = 1, BorderSizePixel = 0,
-            Size = UDim2.new(1, 0, 1, 0), ZIndex = 2,
-        }, frame)
-        local boxStroke = make("UIStroke", { Color = color, Thickness = 1,
-            ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, box)
-
-        local name = make("TextLabel", {
-            BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1),
-            Position = UDim2.new(0.5, 0, 0, -5), Size = UDim2.new(2, 40, 0, 14),
-            Font = Enum.Font.Code, TextSize = 13, TextColor3 = color,
-            TextXAlignment = Enum.TextXAlignment.Center,
-            TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
-        }, frame)
-        local nameStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
-            ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual, Transparency = ident.outline and 0 or 1 }, name)
-
-        local info = make("TextLabel", {
-            BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
-            Position = UDim2.new(0.5, 0, 1, 9), Size = UDim2.new(2, 40, 0, 13),
-            Font = Enum.Font.Code, TextSize = 12, TextColor3 = color,
-            TextXAlignment = Enum.TextXAlignment.Center,
-            TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
-        }, frame)
-        local infoStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
-            ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual, Transparency = ident.outline and 0 or 1 }, info)
-
-        local team = make("Frame", {
-            AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 1, 3),
-            Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Color3.new(1, 1, 1),
-            BorderSizePixel = 0, ZIndex = 2, Visible = false,
-        }, frame)
-
-        local hpBG = make("Frame", {
-            Position = UDim2.new(0, -6, 0, 0), Size = UDim2.new(0, 3, 1, 0),
-            BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35,
-            BorderSizePixel = 0, ZIndex = 2, Visible = false,
-        }, frame)
-        local hpFill = make("Frame", {
-            AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(1, 0, 1, 0),
-            Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(0, 1, 0),
-            BorderSizePixel = 0, ZIndex = 3,
-        }, hpBG)
-
-        return {
-            root = frame, outStroke = outStroke, boxStroke = boxStroke,
-            name = name, nameStroke = nameStroke, info = info, infoStroke = infoStroke,
-            team = team, hpBG = hpBG, hpFill = hpFill,
-            lastCheck = 0, occluded = false,
-        }
-    end
-
-    local function identAdd(plr)
-        if plr == LocalPlayer or identObjects[plr] then return end
-        identObjects[plr] = identMakeObj(plr)
-    end
-
-    for _, plr in ipairs(Players:GetPlayers()) do
-        identAdd(plr)
-    end
-    Players.PlayerAdded:Connect(identAdd)
-    Players.PlayerRemoving:Connect(function(plr)
-        local obj = identObjects[plr]
-        if obj then
-            obj.root:Destroy()
-            identObjects[plr] = nil
-        end
-    end)
-
-    RunService:BindToRenderStep("RA_identifier", Enum.RenderPriority.Camera.Value + 1, function()
-        if not ident.enabled then return end
-        identGui.Enabled = root:GetAttribute("Open") ~= true
-        if not identGui.Enabled then return end
-        local cam = workspace.CurrentCamera
-        if not cam then return end
-        local now = os.clock()
-
-        for plr, obj in pairs(identObjects) do
-            local char = plr.Character
-            local hum = char and char:FindFirstChildOfClass("Humanoid")
-            local ro = char and char:FindFirstChild("HumanoidRootPart")
-            local visible = char and hum and ro and hum.Health > 0
-
-            local dist = 0
-            if visible then
-                dist = (ro.Position - cam.CFrame.Position).Magnitude
-                if dist > ident.maxDistance then
-                    visible = false
-                end
-                if visible and ident.ignoreTeam and plr.Team ~= nil and plr.Team == LocalPlayer.Team then
-                    visible = false
-                end
-            end
-
-            if visible and not ident.showWhenVisible then
-                if now - obj.lastCheck > 0.1 then
-                    obj.lastCheck = now
-                    obj.occluded = identOccluded(char)
-                end
-                if not obj.occluded then
-                    visible = false
-                end
-            end
-
-            if visible then
-                local parts = collectParts(char)
-                if parts then
-                    local minX, minY = math.huge, math.huge
-                    local maxX, maxY = -math.huge, -math.huge
-                    local any = false
-                    for _, part in ipairs(parts) do
-                        local cf, s = part.CFrame, part.Size
-                        local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
-                        for xs = -1, 1, 2 do
-                            for ys = -1, 1, 2 do
-                                for zs = -1, 1, 2 do
-                                    local world = (cf * CFrame.new(hx * xs, hy * ys, hz * zs)).Position
-                                    -- viewport space: this gui ignores the GUI inset,
-                                    -- so viewport coords line up with GetMouseLocation
-                                    local pt = cam:WorldToViewportPoint(world)
-                                    if pt.Z > 0 then
-                                        any = true
-                                        if pt.X < minX then minX = pt.X end
-                                        if pt.Y < minY then minY = pt.Y end
-                                        if pt.X > maxX then maxX = pt.X end
-                                        if pt.Y > maxY then maxY = pt.Y end
-                                    end
-                                end
-                            end
+    -- Shared 3D -> screen bounding box used by I-1 and I-3. Returns
+    -- nil when the character has no projectable parts or sits fully
+    -- behind the camera (no corner with pt.Z > 0).
+    local function projectBox(char, cam)
+        local parts = collectParts(char)
+        if not parts then return nil end
+        local minX, minY = math.huge, math.huge
+        local maxX, maxY = -math.huge, -math.huge
+        local any = false
+        for _, part in ipairs(parts) do
+            local cf, s = part.CFrame, part.Size
+            local hx, hy, hz = s.X * 0.5, s.Y * 0.5, s.Z * 0.5
+            for xs = -1, 1, 2 do
+                for ys = -1, 1, 2 do
+                    for zs = -1, 1, 2 do
+                        local world = (cf * CFrame.new(hx * xs, hy * ys, hz * zs)).Position
+                        -- viewport space: this gui ignores the GUI inset,
+                        -- so viewport coords line up with GetMouseLocation
+                        local pt = cam:WorldToViewportPoint(world)
+                        if pt.Z > 0 then
+                            any = true
+                            if pt.X < minX then minX = pt.X end
+                            if pt.Y < minY then minY = pt.Y end
+                            if pt.X > maxX then maxX = pt.X end
+                            if pt.Y > maxY then maxY = pt.Y end
                         end
                     end
+                end
+            end
+        end
+        if not any then return nil end
+        return { minX = minX, minY = minY, maxX = maxX, maxY = maxY }
+    end
 
-                    if any then
+    -- Shared per-frame gate: health, max distance, team filter and the
+    -- throttled occlusion check. Returns the distance in studs when the
+    -- target should render, nil otherwise. obj carries lastCheck and
+    -- occluded so every mode throttles its own raycasts.
+    local function gateVisible(plr, char, hum, ro, cam, now, obj)
+        if not (char and hum and ro) then return nil end
+        if hum.Health <= 0 then return nil end
+        local dist = (ro.Position - cam.CFrame.Position).Magnitude
+        if dist > ident.maxDistance then return nil end
+        if ident.ignoreTeam and plr.Team ~= nil and plr.Team == LocalPlayer.Team then return nil end
+        if not ident.showWhenVisible then
+            if now - obj.lastCheck > 0.1 then
+                obj.lastCheck = now
+                obj.occluded = occluded(char)
+            end
+            if not obj.occluded then return nil end
+        end
+        return dist
+    end
+
+    ----------------------------------------------------------------
+    -- I-1 :: CLASSIC BOX GRID (the original, behaviour unchanged)
+    ----------------------------------------------------------------
+    local function buildClassicMode()
+        local objects = {}
+
+        local function makeObj(plr)
+            local color = idColorFor(plr)
+
+            local frame = Instance.new("Frame")
+            frame.Visible = false
+            frame.BackgroundTransparency = 1
+            frame.BorderSizePixel = 0
+            frame.Parent = identGui
+
+            local out = make("Frame", {
+                BackgroundTransparency = 1, BorderSizePixel = 0,
+                Position = UDim2.new(0, -1, 0, -1), Size = UDim2.new(1, 2, 1, 2), ZIndex = 1,
+            }, frame)
+            local outStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
+                ApplyStrokeMode = Enum.ApplyStrokeMode.Border, Transparency = ident.outline and 0 or 1 }, out)
+
+            local box = make("Frame", {
+                BackgroundTransparency = 1, BorderSizePixel = 0,
+                Size = UDim2.new(1, 0, 1, 0), ZIndex = 2,
+            }, frame)
+            local boxStroke = make("UIStroke", { Color = color, Thickness = 1,
+                ApplyStrokeMode = Enum.ApplyStrokeMode.Border }, box)
+
+            local name = make("TextLabel", {
+                BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1),
+                Position = UDim2.new(0.5, 0, 0, -5), Size = UDim2.new(2, 40, 0, 14),
+                Font = Enum.Font.Code, TextSize = 13, TextColor3 = color,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+            }, frame)
+            local nameStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
+                ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual, Transparency = ident.outline and 0 or 1 }, name)
+
+            local info = make("TextLabel", {
+                BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 1, 9), Size = UDim2.new(2, 40, 0, 13),
+                Font = Enum.Font.Code, TextSize = 12, TextColor3 = color,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+            }, frame)
+            local infoStroke = make("UIStroke", { Color = Color3.new(0, 0, 0), Thickness = 1,
+                ApplyStrokeMode = Enum.ApplyStrokeMode.Contextual, Transparency = ident.outline and 0 or 1 }, info)
+
+            local team = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 1, 3),
+                Size = UDim2.new(1, 0, 0, 2), BackgroundColor3 = Color3.new(1, 1, 1),
+                BorderSizePixel = 0, ZIndex = 2, Visible = false,
+            }, frame)
+
+            local hpBG = make("Frame", {
+                Position = UDim2.new(0, -6, 0, 0), Size = UDim2.new(0, 3, 1, 0),
+                BackgroundColor3 = Color3.new(0, 0, 0), BackgroundTransparency = 0.35,
+                BorderSizePixel = 0, ZIndex = 2, Visible = false,
+            }, frame)
+            local hpFill = make("Frame", {
+                AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(1, 0, 1, 0),
+                Size = UDim2.new(1, 0, 1, 0), BackgroundColor3 = Color3.new(0, 1, 0),
+                BorderSizePixel = 0, ZIndex = 3,
+            }, hpBG)
+
+            return {
+                root = frame, outStroke = outStroke, boxStroke = boxStroke,
+                name = name, nameStroke = nameStroke, info = info, infoStroke = infoStroke,
+                team = team, hpBG = hpBG, hpFill = hpFill,
+                lastCheck = 0, occluded = false,
+            }
+        end
+
+        local function add(plr)
+            if plr == LocalPlayer or objects[plr] then return end
+            objects[plr] = makeObj(plr)
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            add(plr)
+        end
+        Players.PlayerAdded:Connect(add)
+
+        local function render(now, cam)
+            for plr, obj in pairs(objects) do
+                local char = plr.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local ro = char and char:FindFirstChild("HumanoidRootPart")
+                local dist = gateVisible(plr, char, hum, ro, cam, now, obj)
+                if dist then
+                    local box = projectBox(char, cam)
+                    if box then
                         local pad = 4
-                        local w = math.max(maxX - minX, 8) + pad * 2
-                        local h = math.max(maxY - minY, 16) + pad * 2
-                        obj.root.Position = UDim2.fromOffset(minX - pad, minY - pad)
+                        local w = math.max(box.maxX - box.minX, 8) + pad * 2
+                        local h = math.max(box.maxY - box.minY, 16) + pad * 2
+                        obj.root.Position = UDim2.fromOffset(box.minX - pad, box.minY - pad)
                         obj.root.Size = UDim2.fromOffset(w, h)
 
                         local nm = string.upper(plr.DisplayName)
@@ -777,18 +828,493 @@ runModule("Identifier", function(root)
                 else
                     obj.root.Visible = false
                 end
-            else
+            end
+        end
+
+        local function clear()
+            for _, obj in pairs(objects) do
                 obj.root.Visible = false
             end
         end
+
+        local function remove(plr)
+            local obj = objects[plr]
+            if obj then
+                obj.root:Destroy()
+                objects[plr] = nil
+            end
+        end
+        Players.PlayerRemoving:Connect(remove)
+
+        local function setOutline(on)
+            local t = on and 0 or 1
+            for _, obj in pairs(objects) do
+                obj.outStroke.Transparency = t
+                obj.nameStroke.Transparency = t
+                obj.infoStroke.Transparency = t
+            end
+        end
+
+        return {
+            label = "I-1 :: CLASSIC BOX GRID",
+            render = render, clear = clear, remove = remove, setOutline = setOutline,
+        }
+    end
+
+    ----------------------------------------------------------------
+    -- I-2 :: BASIC HIGHLIGHT
+    --
+    -- One engine Highlight per character. Renders through walls by
+    -- design (it is a joke menu ESP); the "Show When Visible" option
+    -- picks the DepthMode instead of disabling the mode:
+    --   on  -> AlwaysOnTopWhenOccluded (normal depth, glows when
+    --          hidden behind geometry)
+    --   off -> OccludedOnly (mark only appears when fully occluded)
+    ----------------------------------------------------------------
+    local function buildHighlightMode()
+        local marks = {}
+        local gate = {}
+
+        local function add(plr)
+            if plr == LocalPlayer or marks[plr] then return end
+            local col = idColorFor(plr)
+            local hl = Instance.new("Highlight")
+            hl.Name = "RA_I2_Mark_" .. plr.Name
+            hl.FillColor = col
+            hl.FillTransparency = 0.55
+            hl.OutlineColor = col
+            hl.OutlineTransparency = 0
+            hl.DepthMode = Enum.HighlightDepthMode.AlwaysOnTopWhenOccluded
+            hl.Enabled = false
+            -- Highlights must be workspace descendants to render; they
+            -- are Adornee-driven so they survive character respawns.
+            hl.Parent = workspace
+            marks[plr] = hl
+            gate[plr] = { lastCheck = 0, occluded = true }
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            add(plr)
+        end
+        Players.PlayerAdded:Connect(add)
+
+        local function render(now, cam)
+            local dm = ident.showWhenVisible
+                and Enum.HighlightDepthMode.AlwaysOnTopWhenOccluded
+                or Enum.HighlightDepthMode.OccludedOnly
+            for plr, hl in pairs(marks) do
+                local char = plr.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local ro = char and char:FindFirstChild("HumanoidRootPart")
+                local dist = gateVisible(plr, char, hum, ro, cam, now, gate[plr])
+                if hl.DepthMode ~= dm then
+                    hl.DepthMode = dm
+                end
+                if dist then
+                    if hl.Adornee ~= char then
+                        hl.Adornee = char
+                    end
+                    hl.Enabled = true
+                else
+                    hl.Enabled = false
+                end
+            end
+        end
+
+        local function clear()
+            for _, hl in pairs(marks) do
+                hl.Enabled = false
+            end
+        end
+
+        local function remove(plr)
+            local hl = marks[plr]
+            if hl then
+                hl:Destroy()
+                marks[plr] = nil
+                gate[plr] = nil
+            end
+        end
+        Players.PlayerRemoving:Connect(remove)
+
+        -- workspace-parented: not cleaned up by identGui:Destroy()
+        local function destroy()
+            for _, hl in pairs(marks) do
+                hl:Destroy()
+            end
+        end
+
+        return {
+            label = "I-2 :: BASIC HIGHLIGHT",
+            render = render, clear = clear, remove = remove, destroy = destroy,
+        }
+    end
+
+    ----------------------------------------------------------------
+    -- I-3 :: OMNI-VECTOR ARRAY (O.V.A.)
+    --
+    -- The overcomplicated one. Everything below is cosmetic dressing
+    -- on the same projection the classic mode already does:
+    --   * corner brackets color-graded by a "threat score"
+    --   * a rotating lock dial and a scan sweep line
+    --   * a telemetry line fed by the shared INFO LINE toggles
+    --   * tracers from screen bottom-center to every target
+    --   * screen-edge intercept chevrons for off-screen targets
+    --   * a pulsing lock ring on the nearest in-range target
+    -- "SCAN INTENSITY" only changes how fast it all wiggles. It
+    -- affects nothing else. As intended.
+    ----------------------------------------------------------------
+    local function buildOvaMode()
+        local objects = {}
+
+        local TIER = {
+            { color = Color3.fromRGB(96, 255, 96), name = "MINIMAL" },
+            { color = Color3.fromRGB(255, 200, 60), name = "ELEVATED" },
+            { color = Color3.fromRGB(255, 152, 0), name = "SEVERE" },
+            { color = Color3.fromRGB(255, 77, 77), name = "CRITICAL" },
+        }
+        local ARM = 16  -- bracket arm length in px
+
+        -- one L-shaped bracket corner; anchoring the bars with the
+        -- same (ax, ay) as the container keeps all 4 corners correct
+        -- when the root frame resizes
+        local function cornerBox(parent, ax, ay)
+            local c = make("Frame", {
+                AnchorPoint = Vector2.new(ax, ay),
+                Position = UDim2.new(ax, 0, ay, 0),
+                Size = UDim2.fromOffset(ARM, ARM),
+                BackgroundTransparency = 1, BorderSizePixel = 0,
+            }, parent)
+            local hz = make("Frame", {
+                AnchorPoint = Vector2.new(ax, ay),
+                Position = UDim2.new(ax, 0, ay, 0),
+                Size = UDim2.new(0, ARM, 0, 2), BorderSizePixel = 0,
+            }, c)
+            local vt = make("Frame", {
+                AnchorPoint = Vector2.new(ax, ay),
+                Position = UDim2.new(ax, 0, ay, 0),
+                Size = UDim2.new(0, 2, 0, ARM), BorderSizePixel = 0,
+            }, c)
+            return hz, vt
+        end
+
+        -- pulsing lock ring for the closest in-range target
+        local lockRing = make("Frame", {
+            AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(36, 36),
+            BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ZIndex = 6,
+        }, identGui)
+        make("UICorner", { CornerRadius = UDim.new(1, 0) }, lockRing)
+        local lockStroke = make("UIStroke", { Color = COLORS.Active, Thickness = 2 }, lockRing)
+
+        local function makeObj(plr)
+            local frame = Instance.new("Frame")
+            frame.Visible = false
+            frame.BackgroundTransparency = 1
+            frame.BorderSizePixel = 0
+            frame.Parent = identGui
+
+            local corners = {
+                { cornerBox(frame, 0, 0) },
+                { cornerBox(frame, 1, 0) },
+                { cornerBox(frame, 0, 1) },
+                { cornerBox(frame, 1, 1) },
+            }
+
+            -- rotating lock dial: a tick inside a spinning container
+            local dial = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+                Size = UDim2.fromOffset(22, 22),
+                BackgroundTransparency = 1, BorderSizePixel = 0, ZIndex = 3,
+            }, frame)
+            make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0), Position = UDim2.new(0.5, 0, 0, 0),
+                Size = UDim2.fromOffset(2, 6), BorderSizePixel = 0,
+            }, dial)
+            make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.new(0.5, 0, 0.5, 0),
+                Size = UDim2.fromOffset(2, 2), BorderSizePixel = 0, ZIndex = 4,
+            }, frame)
+
+            local sweep = make("Frame", {
+                Size = UDim2.new(1, 0, 0, 1), BackgroundColor3 = COLORS.Active,
+                BackgroundTransparency = 0.55, BorderSizePixel = 0, ZIndex = 2,
+            }, frame)
+
+            local threat = make("TextLabel", {
+                BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1),
+                Position = UDim2.new(0.5, 0, 0, -6), Size = UDim2.new(2, 40, 0, 13),
+                Font = Enum.Font.Code, TextSize = 12, TextColor3 = COLORS.TextSecondary,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+            }, frame)
+
+            local tele = make("TextLabel", {
+                BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
+                Position = UDim2.new(0.5, 0, 1, 9), Size = UDim2.new(2, 40, 0, 13),
+                Font = Enum.Font.Code, TextSize = 11, TextColor3 = COLORS.TextMuted,
+                TextXAlignment = Enum.TextXAlignment.Center,
+                TextTruncate = Enum.TextTruncate.AtEnd, ZIndex = 3,
+            }, frame)
+
+            -- tracer: screen bottom-center -> box center, drawn as a
+            -- rotated 1px bar parented under the (unrotated) box root
+            local tracer = make("Frame", {
+                AnchorPoint = Vector2.new(0, 0.5), Size = UDim2.fromOffset(0, 1),
+                BackgroundColor3 = COLORS.Active, BackgroundTransparency = 0.35,
+                BorderSizePixel = 0, ZIndex = 1, Visible = false,
+            }, frame)
+
+            -- screen-edge intercept chevron; lives on identGui directly
+            -- because the box root is hidden while the target is off-screen
+            local arrow = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Size = UDim2.fromOffset(12, 12),
+                BackgroundTransparency = 1, BorderSizePixel = 0, Visible = false, ZIndex = 5,
+            }, identGui)
+            local ah1 = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(3, 3),
+                Size = UDim2.fromOffset(9, 2), Rotation = 45, BorderSizePixel = 0,
+            }, arrow)
+            local ah2 = make("Frame", {
+                AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromOffset(3, 9),
+                Size = UDim2.fromOffset(9, 2), Rotation = -45, BorderSizePixel = 0,
+            }, arrow)
+
+            return {
+                root = frame, corners = corners, dial = dial, sweep = sweep,
+                threat = threat, tele = tele, tracer = tracer,
+                arrow = arrow, arrowBars = { ah1, ah2 },
+                lastCheck = 0, occluded = false,
+            }
+        end
+
+        local function add(plr)
+            if plr == LocalPlayer or objects[plr] then return end
+            objects[plr] = makeObj(plr)
+        end
+        for _, plr in ipairs(Players:GetPlayers()) do
+            add(plr)
+        end
+        Players.PlayerAdded:Connect(add)
+
+        -- edge chevron toward an off-screen target. Camera right/up
+        -- dot products give the correct screen direction even when the
+        -- target is behind the camera (WorldToViewportPoint would flip).
+        local function drawArrow(obj, ro, cam, vp, color)
+            obj.arrow.Visible = ident.ovaArrows
+            if not ident.ovaArrows then return end
+            local offset = ro.Position - cam.CFrame.Position
+            local sx = offset:Dot(cam.RightVector)
+            local sy = -offset:Dot(cam.UpVector)
+            local mag = math.sqrt(sx * sx + sy * sy)
+            if mag < 1 then
+                obj.arrow.Visible = false
+                return
+            end
+            local padEdge = 30
+            local scale = math.min(vp.X - padEdge * 2, vp.Y - padEdge * 2) * 0.5 / mag
+            obj.arrow.Position = UDim2.fromOffset(vp.X * 0.5 + sx * scale, vp.Y * 0.5 + sy * scale)
+            obj.arrow.Rotation = math.deg(math.atan2(sy, sx))
+            obj.arrowBars[1].BackgroundColor3 = color
+            obj.arrowBars[2].BackgroundColor3 = color
+        end
+
+        local function render(now, cam)
+            local vp = cam.ViewportSize
+            local halfW = vp.X * 0.5
+            local best, bestBox, bestTier, bestDist
+            for plr, obj in pairs(objects) do
+                local char = plr.Character
+                local hum = char and char:FindFirstChildOfClass("Humanoid")
+                local ro = char and char:FindFirstChild("HumanoidRootPart")
+                local dist = gateVisible(plr, char, hum, ro, cam, now, obj)
+                if dist then
+                    -- threat grading: damage + range + velocity, in a
+                    -- formula that pretends to be classified
+                    local hpFrac = hum.Health / math.max(hum.MaxHealth, 1)
+                    local vel = ro.AssemblyLinearVelocity.Magnitude
+                    local score = math.clamp(
+                        (1 - hpFrac) * 40
+                        + (dist / math.max(ident.maxDistance, 1)) * 25
+                        + math.min(vel / 60, 1) * 35, 0, 100)
+                    local tier = TIER[math.min(#TIER, math.floor(score / 25) + 1)]
+
+                    local box = projectBox(char, cam)
+                    if box then
+                        local pad = 6
+                        local w = math.max(box.maxX - box.minX, 8) + pad * 2
+                        local h = math.max(box.maxY - box.minY, 16) + pad * 2
+                        obj.root.Position = UDim2.fromOffset(box.minX - pad, box.minY - pad)
+                        obj.root.Size = UDim2.fromOffset(w, h)
+
+                        for _, pair in ipairs(obj.corners) do
+                            pair[1].BackgroundColor3 = tier.color
+                            pair[2].BackgroundColor3 = tier.color
+                        end
+
+                        -- dial spin + sweep, paced by SCAN INTENSITY
+                        obj.dial.Rotation = (now * 60 * ident.ovaScan) % 360
+                        local sweepPos = math.sin(now * (0.5 + ident.ovaScan * 0.25)) * 0.5 + 0.5
+                        obj.sweep.Position = UDim2.new(0, 0, sweepPos, 0)
+                        obj.sweep.Visible = ident.ovaSweep
+
+                        local nm = string.upper(plr.DisplayName)
+                        if ident.showUsername then
+                            nm = nm .. "(@" .. string.upper(plr.Name) .. ")"
+                        end
+                        obj.threat.Text = nm .. "  THREAT " .. tier.name
+                        obj.threat.TextColor3 = tier.color
+                        obj.threat.Visible = ident.ovaThreat
+
+                        -- telemetry line, fed by the shared INFO LINE toggles
+                        local bits = {}
+                        if ident.health then
+                            table.insert(bits, string.format("VTL %d%%", math.floor(hpFrac * 100 + 0.5)))
+                        end
+                        if ident.showDistance then
+                            table.insert(bits, string.format("DST %dm", math.floor(dist + 0.5)))
+                        end
+                        table.insert(bits, string.format("VEL %.1f", vel))
+                        table.insert(bits, string.format("SIG %.1f", 91 + math.sin(now * ident.ovaScan + plr.UserId) * 6))
+                        table.insert(bits, string.format("PH-%d", math.floor(now * ident.ovaScan * 0.5) % 9))
+                        if ident.showUserId then
+                            table.insert(bits, "UID" .. plr.UserId)
+                        end
+                        if ident.showTeamName and plr.Team then
+                            table.insert(bits, string.upper(plr.Team.Name))
+                        end
+                        if ident.showTool then
+                            local tool = char:FindFirstChildOfClass("Tool")
+                            if tool then
+                                table.insert(bits, string.upper(tool.Name))
+                            end
+                        end
+                        obj.tele.Text = table.concat(bits, "  ")
+                        obj.tele.Visible = ident.ovaTelemetry
+
+                        obj.tracer.Visible = ident.ovaTracers
+                        if ident.ovaTracers then
+                            local rootX, rootY = box.minX - pad, box.minY - pad
+                            local cx = (box.minX + box.maxX) * 0.5
+                            local cy = (box.minY + box.maxY) * 0.5
+                            local dx, dy = cx - halfW, cy - vp.Y
+                            obj.tracer.Position = UDim2.fromOffset(halfW - rootX, vp.Y - rootY)
+                            obj.tracer.Size = UDim2.fromOffset(math.sqrt(dx * dx + dy * dy), 1)
+                            obj.tracer.Rotation = math.deg(math.atan2(dy, dx))
+                            obj.tracer.BackgroundColor3 = tier.color
+                        end
+
+                        obj.root.Visible = true
+                        obj.arrow.Visible = false
+                        if not best or dist < bestDist then
+                            best, bestBox, bestTier, bestDist = obj, box, tier, dist
+                        end
+                    else
+                        obj.root.Visible = false
+                        drawArrow(obj, ro, cam, vp, tier.color)
+                    end
+                else
+                    obj.root.Visible = false
+                    obj.arrow.Visible = false
+                end
+            end
+
+            if best then
+                local cx = (bestBox.minX + bestBox.maxX) * 0.5
+                local cy = (bestBox.minY + bestBox.maxY) * 0.5
+                local pulse = math.sin(now * 6) * 0.5 + 0.5
+                lockRing.Position = UDim2.fromOffset(cx, cy)
+                lockRing.Size = UDim2.fromOffset(34 + pulse * 8, 34 + pulse * 8)
+                lockRing.Visible = true
+                lockStroke.Color = bestTier.color
+                lockStroke.Transparency = 0.6 - pulse * 0.4
+            else
+                lockRing.Visible = false
+            end
+        end
+
+        local function clear()
+            for _, obj in pairs(objects) do
+                obj.root.Visible = false
+                obj.arrow.Visible = false
+            end
+            lockRing.Visible = false
+        end
+
+        local function remove(plr)
+            local obj = objects[plr]
+            if obj then
+                obj.root:Destroy()
+                obj.arrow:Destroy()
+                objects[plr] = nil
+            end
+        end
+        Players.PlayerRemoving:Connect(remove)
+
+        return {
+            label = "I-3 :: OMNI-VECTOR ARRAY",
+            render = render, clear = clear, remove = remove,
+        }
+    end
+
+    local modes = {
+        buildClassicMode(),
+        buildHighlightMode(),
+        buildOvaMode(),
+    }
+
+    RunService:BindToRenderStep("RA_identifier", Enum.RenderPriority.Camera.Value + 1, function()
+        if not ident.enabled then return end
+        identGui.Enabled = root:GetAttribute("Open") ~= true
+        if not identGui.Enabled then
+            -- the overlay gui is hidden while the RA window is open, but
+            -- that does nothing to workspace-parented I-2 highlights, so
+            -- park the active mode explicitly
+            local m = modes[ident.mode]
+            if m then
+                m.clear()
+            end
+            return
+        end
+        local cam = workspace.CurrentCamera
+        if not cam then return end
+        local now = os.clock()
+        local mode = modes[ident.mode]
+        if mode then
+            mode.render(now, cam)
+        end
     end)
+
+    local modeBtns = {}
+    local function selectMode(i)
+        ident.mode = i
+        for n, btn in ipairs(modeBtns) do
+            btn.TextColor3 = (n == i) and COLORS.Active or COLORS.TextSecondary
+        end
+        for n, mode in ipairs(modes) do
+            if n ~= i then
+                mode.clear()
+            end
+        end
+    end
+
+    ui.section("ESP MODE")
+    for i, mode in ipairs(modes) do
+        local idx = i
+        local btn = ui.button(mode.label, 24, function()
+            selectMode(idx)
+        end)
+        table.insert(modeBtns, btn)
+    end
+    selectMode(ident.mode)
+    ui.label("F-6 :: DECOMMISSIONED (operator directive)")
+    ui.label("I-2 obeys Show When Visible, capped at ~31 targets")
+    ui.label("I-3 is cosmetic overload with zero accuracy gain")
 
     local idBtn
     idBtn = ui.button("ENABLE IDENTIFIER", 32, function()
         ident.enabled = not ident.enabled
         if not ident.enabled then
-            for _, obj in pairs(identObjects) do
-                obj.root.Visible = false
+            for _, mode in ipairs(modes) do
+                mode.clear()
             end
         end
         idBtn.Text = ident.enabled and "DISABLE IDENTIFIER" or "ENABLE IDENTIFIER"
@@ -800,12 +1326,7 @@ runModule("Identifier", function(root)
     ui.section("VISIBILITY")
     ui.toggle("Show When Visible", ident, "showWhenVisible")
     ui.toggle("Outlines", ident, "outline", function(v)
-        local t = v and 0 or 1
-        for _, obj in pairs(identObjects) do
-            obj.outStroke.Transparency = t
-            obj.nameStroke.Transparency = t
-            obj.infoStroke.Transparency = t
-        end
+        modes[1].setOutline(v)
     end)
     ui.toggle("Ignore Teammates", ident, "ignoreTeam")
     ui.slider("Max Distance", ident, "maxDistance", 100, 2000)
@@ -821,10 +1342,23 @@ runModule("Identifier", function(root)
     ui.toggle("Username", ident, "showUsername")
     ui.toggle("User ID", ident, "showUserId")
 
+    ui.section("OMNI-VECTOR ARRAY (I-3)")
+    ui.toggle("Tracers", ident, "ovaTracers")
+    ui.toggle("Edge Chevrons", ident, "ovaArrows")
+    ui.toggle("Telemetry Line", ident, "ovaTelemetry")
+    ui.toggle("Threat Grades", ident, "ovaThreat")
+    ui.toggle("Scan Sweep", ident, "ovaSweep")
+    ui.slider("Scan Intensity", ident, "ovaScan", 1, 10)
+
     root.Destroying:Connect(function()
         pcall(function()
             RunService:UnbindFromRenderStep("RA_identifier")
         end)
+        for _, mode in ipairs(modes) do
+            if mode.destroy then
+                mode.destroy()
+            end
+        end
         identGui:Destroy()
     end)
 end)
@@ -959,8 +1493,13 @@ runModule("Aimlock", function(root)
         if LocalPlayer.Character then
             table.insert(filter, LocalPlayer.Character)
         end
+        -- FIX: filter EVERY character, target included. The old exclusion
+        -- (plr.Character ~= targetChar) left the target's own body
+        -- raycastable, so any collidable hit part (R6 HumanoidRootPart,
+        -- games that collify torsos/heads) blocked the ray and
+        -- visible-only mode silently never acquired a target.
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr.Character and plr.Character ~= targetChar then
+            if plr.Character then
                 table.insert(filter, plr.Character)
             end
         end
@@ -1175,7 +1714,9 @@ runModule("Aimlock", function(root)
             end
             return
         end
-        if aim.enabled and aim.mode == "TOGGLE" and aimIsKey(input) then
+        -- FIX: ignore inputs the UI already consumed (typing in a TextBox,
+        -- clicking menu buttons) so the bind can't flip while typing.
+        if not processed and aim.enabled and aim.mode == "TOGGLE" and aimIsKey(input) then
             aim.latched = not aim.latched
         end
     end)
@@ -1350,9 +1891,13 @@ runModule("Overseer", function(root)
     local data = {}
 
     local function makePanel()
+        -- FIX: visibility is controlled by Parent (see update below);
+        -- UIListLayout reserves a slot for every child even when
+        -- Visible = false, so toggling Visible left blank gaps in the
+        -- flagged-player list.
         local f = make("Frame", {
             Size = UDim2.new(1, 0, 0, 54),
-            BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0, Visible = false,
+            BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0,
         }, listHolder)
         local str = make("UIStroke", { Color = COLORS.Divider, Thickness = 1, Transparency = 0.2 }, f)
         local name = make("TextLabel", {
@@ -1419,7 +1964,10 @@ runModule("Overseer", function(root)
     end
 
     local function hideAll(d)
-        d.panel.frame.Visible = false
+        -- FIX: unparent instead of Visible = false (UIListLayout slots)
+        if d.panel.frame.Parent then
+            d.panel.frame.Parent = nil
+        end
         for _, dot in ipairs(d.dots) do
             dot.Visible = false
         end
@@ -1618,8 +2166,13 @@ runModule("Overseer", function(root)
                 d.panel.stroke.Color = col
                 d.panel.fill.BackgroundColor3 = col
                 d.panel.frame.LayoutOrder = math.floor(1000 - d.score)
-                d.panel.frame.Visible = ovs.showPanels and alive
+                local showPanel = ovs.showPanels and alive
                     and (not ovs.onlyFlagged or d.score >= ovs.flagScore)
+                -- FIX: swap Parent instead of Visible so hidden panels
+                -- leave no reserved slot in the UIListLayout.
+                if showPanel ~= (d.panel.frame.Parent == listHolder) then
+                    d.panel.frame.Parent = showPanel and listHolder or nil
+                end
             end
         end
 
