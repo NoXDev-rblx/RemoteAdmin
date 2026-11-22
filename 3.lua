@@ -21,33 +21,19 @@ assert(uiParent, "[RemoteAdmin] file 3: PlayerGui never appeared")
 -- GATE: main.lua (file 1) creates the shared RA_BUS only after its
 -- AllowedUserIds check passes. No bus here = this client is not an
 -- admin: stand down so none of this file's modules ever run.
---
--- FIX (hardening): anything in ReplicatedStorage can be forged locally
--- by an exploiter (they can create a Folder named RA_BUS with Ready =
--- true and the right attributes, then rebuild a matching HUD tree), so
--- a ReplicatedStorage gate can never be trusted for admin-only tools.
--- The strongest compatible setup: the SERVER parents a per-admin copy
--- of RA_BUS under that admin's PlayerGui -- instances a server parents
--- under one player's PlayerGui replicate to that player only. Both
--- locations are accepted here so file 1 can adopt that at its own pace.
 ----------------------------------------------------------------
-local function findBus()
-    return ReplicatedStorage:FindFirstChild("RA_BUS")
-        or (uiParent and uiParent:FindFirstChild("RA_BUS")) or nil
-end
-
 local function gateClosed()
     if LocalPlayer:GetAttribute("RA_GateDenied") == true then
         return true
     end
     local t0 = os.clock()
-    while not findBus() and os.clock() - t0 < 30 do
+    while not ReplicatedStorage:FindFirstChild("RA_BUS") and os.clock() - t0 < 30 do
         if LocalPlayer:GetAttribute("RA_GateDenied") == true then
             return true
         end
         task.wait(0.25)
     end
-    return not findBus()
+    return not ReplicatedStorage:FindFirstChild("RA_BUS")
 end
 
 if gateClosed() then
@@ -480,17 +466,11 @@ local function runModule(name, fn)
                 end
             end)
         end
-        local existing = findBus()
+        local existing = ReplicatedStorage:FindFirstChild("RA_BUS")
         if existing then hookBus(existing) end
         ReplicatedStorage.ChildAdded:Connect(function(child)
             if child.Name == "RA_BUS" then hookBus(child) end
         end)
-        -- FIX: also watch PlayerGui for a server-planted per-admin bus.
-        if uiParent then
-            uiParent.ChildAdded:Connect(function(child)
-                if child.Name == "RA_BUS" then hookBus(child) end
-            end)
-        end
     end)
 end
 
@@ -572,11 +552,7 @@ runModule("Identifier", function(root)
 
     local identRay = RaycastParams.new()
     identRay.FilterType = Enum.RaycastFilterType.Exclude
-    -- RespectCanCollide = false (kept from v1). This ray is only used
-    -- for the "show when occluded" mode; with true, non-collidable map
-    -- decor (invisible zone walls, foliage, thin glass) never counted
-    -- as cover and occluded players were wrongly hidden.
-    identRay.RespectCanCollide = false
+    identRay.RespectCanCollide = true
 
     local PRIORITY = {
         Head = true, HumanoidRootPart = true, Torso = true,
@@ -602,9 +578,7 @@ runModule("Identifier", function(root)
         end
         if #parts < 20 then
             for _, d in ipairs(char:GetDescendants()) do
-                -- skip accessory handles so hats/hair don't inflate the box
-                local parentIsAccessory = d.Parent and d.Parent:IsA("Accoutrement")
-                if d:IsA("BasePart") and not PRIORITY[d.Name] and not parentIsAccessory and d.Transparency < 0.95 then
+                if d:IsA("BasePart") and not PRIORITY[d.Name] and d.Transparency < 0.95 then
                     local s = d.Size
                     if s.X <= 6 and s.Y <= 6 and s.Z <= 6
                         and (d.Position - origin).Magnitude <= 6 then
@@ -1493,13 +1467,8 @@ runModule("Aimlock", function(root)
         if LocalPlayer.Character then
             table.insert(filter, LocalPlayer.Character)
         end
-        -- FIX: filter EVERY character, target included. The old exclusion
-        -- (plr.Character ~= targetChar) left the target's own body
-        -- raycastable, so any collidable hit part (R6 HumanoidRootPart,
-        -- games that collify torsos/heads) blocked the ray and
-        -- visible-only mode silently never acquired a target.
         for _, plr in ipairs(Players:GetPlayers()) do
-            if plr.Character then
+            if plr.Character and plr.Character ~= targetChar then
                 table.insert(filter, plr.Character)
             end
         end
@@ -1714,9 +1683,7 @@ runModule("Aimlock", function(root)
             end
             return
         end
-        -- FIX: ignore inputs the UI already consumed (typing in a TextBox,
-        -- clicking menu buttons) so the bind can't flip while typing.
-        if not processed and aim.enabled and aim.mode == "TOGGLE" and aimIsKey(input) then
+        if aim.enabled and aim.mode == "TOGGLE" and aimIsKey(input) then
             aim.latched = not aim.latched
         end
     end)
@@ -1891,13 +1858,9 @@ runModule("Overseer", function(root)
     local data = {}
 
     local function makePanel()
-        -- FIX: visibility is controlled by Parent (see update below);
-        -- UIListLayout reserves a slot for every child even when
-        -- Visible = false, so toggling Visible left blank gaps in the
-        -- flagged-player list.
         local f = make("Frame", {
             Size = UDim2.new(1, 0, 0, 54),
-            BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0,
+            BackgroundColor3 = COLORS.Panel, BorderSizePixel = 0, Visible = false,
         }, listHolder)
         local str = make("UIStroke", { Color = COLORS.Divider, Thickness = 1, Transparency = 0.2 }, f)
         local name = make("TextLabel", {
@@ -1964,10 +1927,7 @@ runModule("Overseer", function(root)
     end
 
     local function hideAll(d)
-        -- FIX: unparent instead of Visible = false (UIListLayout slots)
-        if d.panel.frame.Parent then
-            d.panel.frame.Parent = nil
-        end
+        d.panel.frame.Visible = false
         for _, dot in ipairs(d.dots) do
             dot.Visible = false
         end
@@ -2166,13 +2126,8 @@ runModule("Overseer", function(root)
                 d.panel.stroke.Color = col
                 d.panel.fill.BackgroundColor3 = col
                 d.panel.frame.LayoutOrder = math.floor(1000 - d.score)
-                local showPanel = ovs.showPanels and alive
+                d.panel.frame.Visible = ovs.showPanels and alive
                     and (not ovs.onlyFlagged or d.score >= ovs.flagScore)
-                -- FIX: swap Parent instead of Visible so hidden panels
-                -- leave no reserved slot in the UIListLayout.
-                if showPanel ~= (d.panel.frame.Parent == listHolder) then
-                    d.panel.frame.Parent = showPanel and listHolder or nil
-                end
             end
         end
 
